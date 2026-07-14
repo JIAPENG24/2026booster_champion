@@ -37,9 +37,9 @@ def support_target(
     react instantly when the ball passes the chaser.
 
     Distance rule (relative to chaser):
-      current < 1 m → target at 1 m  (back up, strafe mode keeps facing ball)
-      current > 4 m → target at 4 m  (close in)
-      otherwise     → keep distance, only lateral strafe to adjust triangle angle
+      current < 1 m   → target at 1 m  (back up, strafe mode keeps facing ball)
+      current > 2.8 m → target at 2.8 m  (close in)
+      otherwise       → keep distance, only lateral strafe to adjust triangle angle
 
     Falls back to ball→own-goal line positioning when no chaser or own pose is
     available.
@@ -101,39 +101,60 @@ def _chaser_relative_target(
 ) -> tuple[float, float]:
     """Compute supporter position behind the chaser with distance clamping.
 
-    Direction: ball → chaser extended (the "behind" direction).
-    Distance: clamped to [1, 4] m from the chaser based on current separation.
-    Angle:    10°–45° lateral offset (dynamic by ball field position).
+    Direction: blends stable ball→own-goal with ball→chaser, weighted by how
+    far the chaser is from the ball.  When the chaser is near the ball the
+    goal direction dominates (stable); when the chaser is farther away the
+    chaser direction takes over (accurate).
+
+    Distance:  clamped to [1, 2.8] m from the chaser based on current separation.
+    Angle:     10°–45° lateral offset, scaled down near sidelines to avoid
+               clamping the target into the field corner.
     """
 
-    # Behind-direction: from ball through chaser
+    # ── P1: stable behind-direction = goal-direction / chaser-direction blend ──
+    goal_dx = -config.field_length / 2.0 - ball.x
+    goal_dy = -ball.y
+    goal_len = math.hypot(goal_dx, goal_dy)
+    goal_ux = goal_dx / goal_len
+    goal_uy = goal_dy / goal_len
+
     bc_dx = chaser_pose.x - ball.x
     bc_dy = chaser_pose.y - ball.y
     bc_len = math.hypot(bc_dx, bc_dy)
+
     if bc_len < 1e-6:
-        bc_dx, bc_dy = -1.0, 0.0
-        bc_len = 1.0
-    bx = bc_dx / bc_len
-    by = bc_dy / bc_len
+        bx, by = goal_ux, goal_uy
+    else:
+        bc_ux, bc_uy = bc_dx / bc_len, bc_dy / bc_len
+        # blend: 0.0 at bc_len≤0.3 (goal-only), 1.0 at bc_len≥0.8 (chaser-only)
+        blend = max(0.0, min(1.0, (bc_len - 0.3) / 0.5))
+        bx = goal_ux + (bc_ux - goal_ux) * blend
+        by = goal_uy + (bc_uy - goal_uy) * blend
+        bl = math.hypot(bx, by)
+        if bl > 1e-6:
+            bx, by = bx / bl, by / bl
 
-    # Current supporter → chaser distance
-    sc_dx = own_pose.x - chaser_pose.x
-    sc_dy = own_pose.y - chaser_pose.y
-    sc_dist = math.hypot(sc_dx, sc_dy)
-
-    # Clamp desired distance to [1, 4]
+    # ── Distance: clamped to [1, 2.8] m from chaser ──
+    sc_dist = math.hypot(
+        own_pose.x - chaser_pose.x, own_pose.y - chaser_pose.y,
+    )
     if sc_dist < 1.0:
         desired_dist = 1.0
-    elif sc_dist > 4.0:
-        desired_dist = 4.0
+    elif sc_dist > 2.8:
+        desired_dist = 2.8
     else:
         desired_dist = sc_dist
 
-    # Triangle angle: 10° in defence → 45° in attack
-    t = max(0.0, min(1.0, (ball.x + config.field_length / 2.0) / config.field_length))
-    angle_rad = math.radians(10.0 + t * 35.0)
+    # ── P2: triangle angle scaled down near sideline to avoid corner clamp ──
+    t = max(0.0, min(1.0,
+        (ball.x + config.field_length / 2.0) / config.field_length,
+    ))
+    base_deg = 10.0 + t * 35.0
+    dist_to_sideline = config.field_width / 2.0 - abs(ball.y)
+    angle_scale = max(0.0, min(1.0, dist_to_sideline / 1.5))
+    angle_rad = math.radians(10.0 + (base_deg - 10.0) * angle_scale)
 
-    # Rotate behind-direction by angle_rad; side alternates by player_id parity
+    # Side alternates by player_id parity.
     side = 1.0 if player_id % 2 == 0 else -1.0
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
@@ -142,6 +163,26 @@ def _chaser_relative_target(
 
     tx = chaser_pose.x + desired_dist * dir_x
     ty = chaser_pose.y + desired_dist * dir_y
+
+    # ── P3: back off along direction if target would leave the field ──
+    # Avoid clamp_inside_field jumping the target to a far-away boundary
+    # corner; instead shorten the distance so the target slides along the
+    # boundary naturally.
+    half_x = config.field_length / 2.0 - 0.25
+    half_y = config.field_width / 2.0 - 0.25
+    if not (-half_x <= tx <= half_x and -half_y <= ty <= half_y):
+        scale = 1.0
+        cx, cy = chaser_pose.x, chaser_pose.y
+        if abs(tx - cx) > 1e-6:
+            limit = half_x if tx > cx else -half_x
+            scale = min(scale, (limit - cx) / (tx - cx))
+        if abs(ty - cy) > 1e-6:
+            limit = half_y if ty > cy else -half_y
+            scale = min(scale, (limit - cy) / (ty - cy))
+        if scale > 0.0 and scale * desired_dist >= 0.5:
+            tx = cx + (tx - cx) * scale
+            ty = cy + (ty - cy) * scale
+
     return tx, ty
 
 

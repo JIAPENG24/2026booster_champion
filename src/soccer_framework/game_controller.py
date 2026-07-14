@@ -116,7 +116,7 @@ class GameControllerRosProvider:
         self._logger.info(
             "GameController state changed",
             event="game_controller_state_changed",
-            console=False,
+            console=True,
             team_id=self._config.team_id,
             packet_number=game_state.packet_number,
             state=game_state.state.value,

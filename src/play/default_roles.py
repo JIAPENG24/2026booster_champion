@@ -180,12 +180,16 @@ class SupporterRole(RoleStrategy):
     name = "supporter"
 
     _PUSHOUT_LOG_INTERVAL_SEC = 2.0
+    _STATUS_LOG_INTERVAL_SEC = 2.0  # 0.5 Hz periodic status
 
     def __init__(self) -> None:
         self._was_pushed: bool = False
         self._pushout_logged: bool = False
         self._last_pushout_log_at: float = 0.0
         self._last_decision: str | None = None
+        self._last_status_log_at: float = 0.0
+        self._last_mode: str | None = None
+        self._was_willing_to_kick: bool = False
 
     def target(
         self,
@@ -221,7 +225,126 @@ class SupporterRole(RoleStrategy):
                         ball_y=round(context.known_ball.y, 3),
                     )
 
+        self._log_status(kit, player_id, context, target)
         return target
+
+    def _log_status(
+        self,
+        kit: "SoccerKit",
+        player_id: int,
+        context: PlayContext,
+        target: Pose2D,
+    ) -> None:
+        """Periodic (0.5 Hz) or event-triggered supporter status log.
+
+        Tracks chaser-relative distance, triangle angle, facing error, and
+        positioning mode (backup / closein / hold / fallback) for evaluating
+        the supporter strategy.
+        """
+
+        logger = kit.logger
+        if logger is None:
+            return
+
+        ball = context.known_ball
+        own_robot = context.teammates.get(player_id)
+        if own_robot is None or own_robot.pose is None:
+            return
+
+        own_pose = own_robot.pose
+        sb_dist = math.hypot(ball.x - own_pose.x, ball.y - own_pose.y)
+
+        # Find chaser (non-GK teammate closest to ball)
+        gk_id = kit.config.goalkeeper_player_id()
+        game = context.known_game
+        chaser_id: int | None = None
+        chaser_pose: Pose2D | None = None
+        chaser_ball_dist = float("inf")
+        for tid, trobot in context.teammates.items():
+            if (
+                tid == player_id
+                or trobot.pose is None
+                or not kit.is_player_allowed(game, tid)
+            ):
+                continue
+            if tid == gk_id:
+                continue
+            dist = math.hypot(ball.x - trobot.pose.x, ball.y - trobot.pose.y)
+            if dist < chaser_ball_dist:
+                chaser_ball_dist = dist
+                chaser_id = tid
+                chaser_pose = trobot.pose
+
+        # Compute metrics and mode
+        if chaser_pose is not None:
+            sc_dist = math.hypot(
+                own_pose.x - chaser_pose.x, own_pose.y - chaser_pose.y,
+            )
+            cb_dist = chaser_ball_dist
+            if sc_dist < 1.0:
+                mode = "backup"
+            elif sc_dist > 2.8:
+                mode = "closein"
+            else:
+                mode = "hold"
+
+            # Triangle angle at chaser: angle between chaser→ball and chaser→supporter
+            vcb_x = ball.x - chaser_pose.x
+            vcb_y = ball.y - chaser_pose.y
+            vcs_x = own_pose.x - chaser_pose.x
+            vcs_y = own_pose.y - chaser_pose.y
+            vcb_len = math.hypot(vcb_x, vcb_y)
+            vcs_len = math.hypot(vcs_x, vcs_y)
+            if vcb_len > 1e-6 and vcs_len > 1e-6:
+                dot = max(-1.0, min(1.0,
+                    (vcb_x * vcs_x + vcb_y * vcs_y) / (vcb_len * vcs_len),
+                ))
+                tri_angle = round(math.degrees(math.acos(dot)), 1)
+            else:
+                tri_angle = -1.0
+        else:
+            sc_dist = -1.0
+            cb_dist = -1.0
+            tri_angle = -1.0
+            mode = "fallback"
+
+        # Facing error: how well supporter theta points at ball
+        desired_theta = math.atan2(ball.y - own_pose.y, ball.x - own_pose.x)
+        facing_err = abs(normalize_angle(own_pose.theta - desired_theta))
+
+        # Event trigger: mode change
+        mode_changed = mode != self._last_mode
+        if mode_changed:
+            self._last_mode = mode
+
+        # Throttle: 0.5 Hz periodic or event-triggered
+        now = time.monotonic()
+        if not mode_changed and now - self._last_status_log_at < self._STATUS_LOG_INTERVAL_SEC:
+            return
+        self._last_status_log_at = now
+
+        logger.info(
+            f"supporter status player={player_id} mode={mode} "
+            f"sc_dist={sc_dist:.2f} sb_dist={sb_dist:.2f} cb_dist={cb_dist:.2f} "
+            f"tri_angle={tri_angle:.1f} facing_err={facing_err:.2f} "
+            f"chaser={chaser_id} "
+            f"target=({target.x:.2f},{target.y:.2f}) "
+            f"ball=({ball.x:.2f},{ball.y:.2f})",
+            event="supporter_status",
+            player_id=player_id,
+            mode=mode,
+            sc_dist=round(sc_dist, 2),
+            sb_dist=round(sb_dist, 2),
+            cb_dist=round(cb_dist, 2),
+            triangle_angle=tri_angle,
+            facing_error=round(facing_err, 2),
+            facing_ball=facing_err < 0.3,
+            chaser_id=chaser_id,
+            target_x=round(target.x, 2),
+            target_y=round(target.y, 2),
+            ball_x=round(ball.x, 2),
+            ball_y=round(ball.y, 2),
+        )
 
     def wants_to_kick(
         self,
@@ -232,12 +355,14 @@ class SupporterRole(RoleStrategy):
         ball = context.known_ball
         robot = context.teammates.get(player_id)
         if robot is None or robot.pose is None:
+            self._was_willing_to_kick = False
             return False
 
         gk_id = kit.config.goalkeeper_player_id()
         game = context.known_game
         my_dist = math.hypot(ball.x - robot.pose.x, ball.y - robot.pose.y)
 
+        min_gap = float("inf")
         for tid, trobot in context.teammates.items():
             if (
                 tid == player_id
@@ -247,13 +372,21 @@ class SupporterRole(RoleStrategy):
                 continue
             if tid == gk_id:
                 continue
-            teammate_dist = math.hypot(
-                ball.x - trobot.pose.x, ball.y - trobot.pose.y
-            )
-            if teammate_dist < my_dist - 0.3:
-                return False
+            gap = math.hypot(
+                ball.x - trobot.pose.x, ball.y - trobot.pose.y,
+            ) - my_dist
+            if gap < min_gap:
+                min_gap = gap
 
-        return True
+        # P5: asymmetric hysteresis — enter kick only when clearly alone,
+        # exit only when teammate gets very close.
+        if self._was_willing_to_kick:
+            willing = min_gap > 0.5     # exit: teammate within 0.5 m
+        else:
+            willing = min_gap > 1.5     # enter: alone by 1.5 m
+
+        self._was_willing_to_kick = willing
+        return willing
 
     def kick_target(
         self,
@@ -667,7 +800,7 @@ class GoalkeeperRole(RoleStrategy):
             teammate_dist = math.hypot(
                 ball.x - trobot.pose.x, ball.y - trobot.pose.y,
             )
-            if teammate_dist < my_dist - 0.3:
+            if teammate_dist < my_dist + 1.0:
                 return False
 
         return True
