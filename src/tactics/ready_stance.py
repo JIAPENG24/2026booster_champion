@@ -17,21 +17,45 @@ from ..soccer_framework import (
 )
 from .geometry import TeamFieldFrame, clamp
 
+# Precise 3v3 kickoff positions from docs/开场位置.txt
+# Key: (own_restart: bool, slot: ReadySlot)
+_KICKOFF_TARGETS: dict[tuple[bool, ReadySlot], Pose2D] = {
+    (True, ReadySlot.CENTER):  Pose2D(x=-0.75, y=-0.75, theta=0.785),
+    (True, ReadySlot.SIDE):    Pose2D(x=-1.5,  y=1.35,  theta=0.0),
+    (True, ReadySlot.KEEPER):  Pose2D(x=-6.5,  y=0.0,   theta=0.0),
+    (False, ReadySlot.CENTER): Pose2D(x=-2.80, y=-0.2,  theta=0.0),
+    (False, ReadySlot.SIDE):   Pose2D(x=-4.5,  y=0.8,   theta=0.0),
+    (False, ReadySlot.KEEPER): Pose2D(x=-6.0,  y=-1.0,  theta=0.0),
+}
+
 
 class ReadyStance:
-    """READY-stage target-position calculation.
+    """READY-stage target-position calculation, including precise kickoff positions.
 
-    Three pieces of logic:
+    Four pieces of logic:
 
     :meth:`base_ready_target`: base positions for CENTER, SIDE, and KEEPER.
     :meth:`ready_target_for`: final target from current SetPlay and ball position,
-    including own restart, opponent restart, or base target.
+    including own restart, opponent restart, or precise kickoff-table target.
     :meth:`goalkeeper_guard_target`: goalkeeper guard-position formula.
+    :attr:`_KICKOFF_TARGETS`: hardcoded table of 3v3 kickoff positions used during
+    the READY phase of kickoffs (own and opponent).
     """
 
     def __init__(self, config: SoccerConfig, field: TeamFieldFrame):
         self.config = config
         self.field = field
+
+    def _kickoff_target(
+        self,
+        slot: ReadySlot,
+        own_restart: bool,
+    ) -> Pose2D:
+        """Return a precise kickoff position from the table, falling back to computed base target."""
+        target = _KICKOFF_TARGETS.get((own_restart, slot))
+        if target is not None:
+            return target
+        return self.base_ready_target(slot, own_restart)
 
     def base_ready_target(
         self,
@@ -78,11 +102,20 @@ class ReadyStance:
     ) -> Pose2D:
         """Compute READY positioning from the current SetPlay and ball position.
 
-        No SetPlay or no ball: use base target.
-        Own restart: stand close to the ball, ready to restart.
-        Opponent restart: avoid the configured area around the ball.
+        During kickoff (READY or opponent kickoff hold with a known kicking team),
+        use precise table positions from _KICKOFF_TARGETS.
+        Otherwise, fall through to the original logic:
+        - No SetPlay or no ball: use base target.
+        - Own restart: stand close to the ball, ready to restart.
+        - Opponent restart: avoid the configured area around the ball.
         """
         own_restart = game.is_restart_for_team(self.config.team_id)
+
+        # Kickoff positioning: when there IS a kicking team and no active set play,
+        # the robots should use precise table positions.
+        if game.set_play == SetPlay.NONE and game.has_kicking_team():
+            return self._kickoff_target(slot, own_restart)
+
         base_target = self.base_ready_target(slot, own_restart)
         if game.set_play == SetPlay.NONE or ball is None:
             return base_target

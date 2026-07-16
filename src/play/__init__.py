@@ -11,6 +11,7 @@ All roles extend :class:`RoleStrategy`; the required contract is
 """
 
 from ..soccer_framework import PlayContext
+from .phases import MatchPhase, detect_phase
 from .default_roles import (
     ChaserRole,
     DefenderRole,
@@ -29,6 +30,7 @@ from .nodes import (
 )
 from .playbook import (
     DefaultPlaybook,
+    PhasePlaybook,
     Playbook,
     ROLE_CHASER,
     ROLE_GOALKEEPER,
@@ -47,13 +49,14 @@ from .play_subtree import create_play_subtree
 # ----------------------------------------------------------------------
 # Built-in Playbook registration is visible and uses the same API as custom Playbooks.
 # ----------------------------------------------------------------------
-PLAYBOOKS.register("default", DefaultPlaybook, default=True)
+PLAYBOOKS.register("default", PhasePlaybook, default=True)
 
 __all__ = [
     "AssignRoles",
     "AttackSubtreeConfig",
     "ChaserRole",
     "DefaultPlaybook",
+    "detect_phase",
     "DefenderRole",
     "GoalkeeperRole",
     "IsRole",
@@ -61,7 +64,9 @@ __all__ = [
     "KickAction",
     "MoveToTarget",
     "PLAYBOOKS",
+    "MatchPhase",
     "PlayContext",
+    "PhasePlaybook",
     "Playbook",
     "PlaybookRegistry",
     "ROLE_CHASER",

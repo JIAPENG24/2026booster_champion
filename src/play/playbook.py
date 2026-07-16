@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from ..soccer_framework import PlayContext, ReadySlot, RobotCommand
 from ..runtime import SoccerKit
+from .phases import MatchPhase, detect_phase
 
 if TYPE_CHECKING:
     from .role import RoleRegistry, RoleStrategy
@@ -232,3 +233,137 @@ class DefaultPlaybook(Playbook):
         if slot == ReadySlot.SIDE:
             return targeting.side_should_challenge(context)
         return True
+
+
+# ----------------------------------------------------------------------
+# Phase-aware playbook: dispatches to phase-specific strategy
+# ----------------------------------------------------------------------
+
+
+class PhasePlaybook(DefaultPlaybook):
+    """Phase-aware playbook that dispatches role assignment by match situation.
+
+    Each :class:`MatchPhase` gets its own ``_<phase>_assign_roles`` method.
+    Initially **all phases inherit** :class:`DefaultPlaybook` behavior.
+
+    To customize a phase, subclass ``PhasePlaybook`` and override the specific
+    method.  For example::
+
+        class MyPlaybook(PhasePlaybook):
+            def _our_kickoff_assign_roles(self, context):
+                # Custom kickoff logic here
+                return RoleAssignment(...)
+
+    Usage
+    -----
+    Registered as the new default in :mod:`src.play.__init__`::
+
+        PLAYBOOKS.register("default", PhasePlaybook, default=True)
+
+    The existing runtime code picks it up automatically via
+    ``PLAYBOOKS.create_default()``.
+    """
+
+    def assign_roles(self, context: PlayContext) -> RoleAssignment:
+        """Override Playbook.assign_roles: detect phase and dispatch."""
+        game = context.known_game
+        phase = detect_phase(self.kit.config.team_id, game)
+        return self._dispatch(phase, context)
+
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    def _dispatch(
+        self,
+        phase: MatchPhase,
+        context: PlayContext,
+    ) -> RoleAssignment:
+        """Look up the phase handler and call it.
+
+        Subclasses can override this to install custom dispatch logic or
+        logging, but the normal pattern is to override the individual
+        ``_<phase>_assign_roles`` methods instead.
+        """
+        handler = _PHASE_DISPATCH.get(phase)
+        if handler is None:
+            return self._normal_play_assign_roles(context)
+        return handler(self, context)
+
+    # ------------------------------------------------------------------
+    # Default fallback (used by all phases initially)
+    # ------------------------------------------------------------------
+
+    def _default_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        """Default: delegate to DefaultPlaybook.assign_roles."""
+        return super().assign_roles(context)
+
+    # ------------------------------------------------------------------
+    # Phase-specific handlers (all point to _default_assign_roles initially)
+    #
+    # Override any of these in a subclass to customize that phase.
+    # ------------------------------------------------------------------
+
+    def _our_kickoff_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_kickoff_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _drop_ball_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _our_throw_in_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _our_goal_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _our_corner_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _our_free_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _our_penalty_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_throw_in_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_goal_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_corner_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_free_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _opponent_penalty_kick_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+    def _normal_play_assign_roles(self, context: PlayContext) -> RoleAssignment:
+        return self._default_assign_roles(context)
+
+
+# ---------------------------------------------------------------------------
+# Phase dispatch table: maps each MatchPhase to its handler method.
+# ---------------------------------------------------------------------------
+
+_PHASE_DISPATCH: dict[MatchPhase, callable] = {
+    MatchPhase.OUR_KICKOFF: PhasePlaybook._our_kickoff_assign_roles,
+    MatchPhase.OPPONENT_KICKOFF: PhasePlaybook._opponent_kickoff_assign_roles,
+    MatchPhase.DROP_BALL: PhasePlaybook._drop_ball_assign_roles,
+    MatchPhase.OUR_THROW_IN: PhasePlaybook._our_throw_in_assign_roles,
+    MatchPhase.OUR_GOAL_KICK: PhasePlaybook._our_goal_kick_assign_roles,
+    MatchPhase.OUR_CORNER_KICK: PhasePlaybook._our_corner_kick_assign_roles,
+    MatchPhase.OUR_FREE_KICK: PhasePlaybook._our_free_kick_assign_roles,
+    MatchPhase.OUR_PENALTY_KICK: PhasePlaybook._our_penalty_kick_assign_roles,
+    MatchPhase.OPPONENT_THROW_IN: PhasePlaybook._opponent_throw_in_assign_roles,
+    MatchPhase.OPPONENT_GOAL_KICK: PhasePlaybook._opponent_goal_kick_assign_roles,
+    MatchPhase.OPPONENT_CORNER_KICK: PhasePlaybook._opponent_corner_kick_assign_roles,
+    MatchPhase.OPPONENT_FREE_KICK: PhasePlaybook._opponent_free_kick_assign_roles,
+    MatchPhase.OPPONENT_PENALTY_KICK: PhasePlaybook._opponent_penalty_kick_assign_roles,
+    MatchPhase.NORMAL_PLAY: PhasePlaybook._normal_play_assign_roles,
+}
