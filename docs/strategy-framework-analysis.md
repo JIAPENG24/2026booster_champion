@@ -183,7 +183,7 @@ PlayingPhase = Sequence(IsGameInState(PLAYING), PlayKickoffController, Selector(
 | **守门员防守区** | `ball.x < -2.8` 且 `|ball.y| ≤ 2.2` | `ball_in_own_defensive_area` | KEEPER 可参与争球（RUSH_OUT/扑救）；chaser 锁定 3.0s |
 | **己方半场/中场** | `ball.x < +2.8` | `ball_is_in_midfield_or_own_half` | SIDE 总是参与挑战；chaser 锁定 2.0s（若 `ball.x < area_x`） |
 | **进攻区** | `ball.x ≥ +2.8` | （上述取反） | SIDE 仅当比 CENTER 近 0.20m 才挑战；chaser 锁定 0.5s |
-| **危险区** | `ball.x < own_goal_x + 1.5 = -5.5` | desperation 判定 | 守门员 desperation 模式（直接扑球） |
+| **危险区** | `ball.x < own_goal_x + gk_rush_out_max_dist_m = -5.5` | max-dist 滤网 | 守门员 RUSH_OUT 仅停止点近球门线时触发（外场可处理时不贸然出击） |
 
 **区域边界计算**（`predicates.py`，函数签名统一为 `(config, ...)`，第一个参数恒为 `SoccerStrategyTuning`）：
 - `goalkeeper_defensive_area(config)` → `(area_x, area_y)`：`area_x = -field_length * goalkeeper_challenge_area_x_ratio = -14*0.20 = -2.8m`；`area_y = min(field_width/2-0.35, goalkeeper_challenge_area_y) = min(4.15, 2.2) = 2.2m`
@@ -204,8 +204,7 @@ PlayingPhase = Sequence(IsGameInState(PLAYING), PlayKickoffController, Selector(
 #### 防守区（`ball.x < -2.8`）
 - **chaser 锁定延长**：`ball.x < own_goal_x+1.5(-5.5)` → 锁 3.0s；`ball.x < area_x(-2.8)` → 锁 2.0s（防乒乓切换）
 - **KEEPER 参与争球**：`_slot_can_challenge(KEEPER)` 返回 True（用 `goalkeeper_clear_hold_sec=1.5s` 时间保持 + `goalkeeper_challenge_hysteresis_m=0.30m` 滞回）
-- **守门员 desperation**：`ball.x < -5.5` → 直接扑球，`wants_to_kick` 总 True
-- **守门员 RUSH_OUT**：球预测停止点在防守区内 → 冲出拦截解围
+- **守门员 RUSH_OUT**：预测停止点近球门线（`rest_x < own_goal_x + gk_rush_out_max_dist_m`）+ 防守区内且外场来不及处理 → 两阶段冲出（far 直线跑/near 绕后踢球）
 - **守门员 LATERAL**：球预测将穿过球门线门柱内 → 横向封堵
 
 #### 中场/己方半场（`ball.x < +2.8`）
@@ -354,7 +353,7 @@ PlayingPhase = Sequence(IsGameInState(PLAYING), PlayKickoffController, Selector(
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `ball_prediction_history_size` | 10 | 历史帧数 |
+| `ball_prediction_history_size` | 20 | 历史帧数（3 帧差分+摩擦补偿回归） |
 | `ball_prediction_kp` | 0.6 | PID 比例 |
 | `ball_prediction_ki` | 0.05 | PID 积分 |
 | `ball_prediction_kd` | 0.1 | PID 微分 |
@@ -373,7 +372,7 @@ PlayingPhase = Sequence(IsGameInState(PLAYING), PlayKickoffController, Selector(
 | `gk_rush_out_margin_m` | 0.8 m | RUSH_OUT 触发余量 |
 | `gk_rush_out_exit_margin_m` | 0.3 m | RUSH_OUT 退出余量 |
 | `gk_lateral_hold_min_sec` | 0.8 s | LATERAL 最小保持时间 |
-| `gk_desperation_clear_margin_m` | 1.5 m | desperation 触发余量（ball.x < own_goal_x+1.5） |
+| `gk_rush_out_max_dist_m` | 1.5 m | RUSH_OUT 预测停止点距球门线最大距离（替代 desperation） |
 
 ### 3.14 边线 / 球门线恢复
 
@@ -544,7 +543,7 @@ select_chaser(context) → player_id
 | build_subtree | `MoveToTarget(hold_vyaw=0.12)` |
 
 #### GoalkeeperRole（name="goalkeeper"）— 守门员
-三态状态机 + desperation：
+三态状态机（无 desperation），RUSH_OUT 分两阶段：
 
 ```
         ┌─────────────────────────────────────────┐
@@ -553,29 +552,32 @@ select_chaser(context) → player_id
                            │
                            ▼
    ┌─────────────────────────────────────┐
-   │          GUARD（默认弧形站位）        │
+   │          GUARD（动态弧形站位）        │
    │   goalkeeper_guard_target            │
-   │   goal_line_x = own_goal_x + 1.3     │
-   │   R = 1.4m 弧形                      │
+   │   goal_line_x = own_goal_x + depth   │
+   │   R = 1.4*scale, depth=1.3*scale    │
+   │   (scale↓ball远→收窄防吊门)           │
    └────┬──────────────────┬──────────────┘
-        │ 球预测停止点       │ 球预测穿过门柱内
-        │ 在防守区内         │
+        │ 预测停止点近球门线 │ 球预测穿过门柱内
+        │ 距球门≤1.5m+     │
+        │ 外场来不及处理     │
         ▼                  ▼
    ┌──────────┐       ┌──────────────┐
    │ RUSH_OUT │       │   LATERAL    │
-   │ 冲出拦截  │       │ 横向封堵      │
-   │ 解围      │       │ 沿守门深度线  │
-   └──────────┘       └──────────────┘
-
-   desperation: ball.x < own_goal_x+1.5(-5.5) → 直接扑球
-     target = approach_target(ball, kick_theta=0.0(向+x进攻方向), approach_offset=0.2)
+   │ 两阶段:   │       │ 横向封堵      │
+   │ far(>0.5)│       │ 沿守门深度线  │
+   │  →直线跑  │       └──────────────┘
+   │ near(≤0.5)│
+   │  →绕后踢球 │
+   └──────────┘
 ```
 
 | 属性 | 值/行为 |
 |------|---------|
 | approach offset | `_APPROACH_OFFSET=0.18m` |
-| wants_to_kick | desperation 总 True；RUSH_OUT 时若外场队友更近（<my_dist+1.0m）则让球 |
-| kick_target | desperation→对方球门；**静态球门区**（`ball.x < own_goal_x+0.8(-6.2)` 且球速<0.3）→强制中路；否则 5 候选（center/top门柱/bottom门柱/top边线/bottom边线）按 `lane_clear_score - 0.3*turn` 选最优并锁定整个解围周期 |
+| rush_approach_stage | `"far"`（>0.5m 直线跑）→ `"near"`（≤0.5m 绕后踢球） |
+| wants_to_kick | stage far→False；stage near→评估；外场队友更近（<my_dist+1.0）→让球 |
+| kick_target | 无 desperation；**静态球门区**（`ball.x < own_goal_x+0.8(-6.2)` 且球速<0.3）→强制中路；否则 5 候选（center/top门柱/bottom门柱/top边线/bottom边线）按 `lane_clear_score - 0.3*turn` 选最优并锁定整个解围周期 |
 | build_subtree | `build_attack_subtree(hold_vyaw=0.12, strafe=True, speed=2.2, kick_power=3.5, lateral_speed=1.0)` |
 | 状态去抖 | 进入 confirm=2 帧；退出 RUSH_OUT release=4 帧；LATERAL 保持 min=0.8s |
 | target 平滑 | `gk_target_smooth_speed=2.0m/s` 限速 |

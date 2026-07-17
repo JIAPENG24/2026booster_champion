@@ -176,13 +176,31 @@ class ReadyStance:
         return result
 
     def goalkeeper_guard_target(self, ball: BallState | None) -> Pose2D:
-        """Goalkeeper guard formula; blends between goal-line deep and arc positioning."""
-        GK = self.field.own_goal_x()
-        goal_line_x = GK + self.config.strategy.goalkeeper_guard_depth_m
-        if ball is None:
-            return Pose2D(goal_line_x, 0.0, self.field.attack_theta())
+        """Goalkeeper guard formula; blends between goal-line deep and arc positioning.
 
-        R = self.config.strategy.goalkeeper_guard_arc_radius
+        Arc radius and guard depth are dynamically scaled by ball distance from
+        the goal line — close ball maximises angle coverage (full radius/depth),
+        far ball pulls the keeper deeper (reduced radius) to protect against
+        chips/long-range shots.
+        """
+        GK = self.field.own_goal_x()
+        strat = self.config.strategy
+        base_R = strat.goalkeeper_guard_arc_radius
+        base_depth = strat.goalkeeper_guard_depth_m
+
+        if ball is None:
+            return Pose2D(GK + base_depth, 0.0, self.field.attack_theta())
+
+        # Dynamic scale based on ball distance from our goal line.
+        # At dist=0  (ball in goal) → scale=1.0 (full width/depth)
+        # At dist=7  (half field)  → scale=0.6 (tight)
+        ball_dist = math.hypot(ball.x - GK, ball.y)
+        norm = min(ball_dist / (self.config.field_length * 0.5), 1.0)
+        scale = 1.0 - 0.4 * norm  # 1.0 → 0.6
+        R = base_R * scale
+        depth = base_depth * (1.0 - 0.3 * norm)  # 1.3 → 0.91
+
+        goal_line_x = GK + depth
 
         # Step 1 — arc intersection: ball-to-goal-center line ∩ circle(GK, R)
         dx = ball.x - GK

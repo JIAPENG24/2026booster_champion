@@ -168,14 +168,16 @@ Transitions: Phase0→1 (our kickoff detected), Phase1→2 (ball moved + 0.5s), 
 | `goalkeeper` | GoalkeeperRole | speed=2.2, kick_power=3.5, lateral_speed=1.0, hold_vyaw=0.12, strafe=True | 3 |
 | `defender` | DefenderRole | hold_vyaw=0.12, reuses SupporterRole.target | 4 (extensioin) |
 
-### Goalkeeper State Machine (3-state + desperation)
+### Goalkeeper State Machine (3-state, no desperation)
 
-1. **GUARD** (default): Arc-based positioning via `goalkeeper_guard_target` formula — intersection of ball→goal-center line with arc(R=1.4) at depth=1.3m. Smoothstep lerps between arc and goal line. Face ball always.
-2. **RUSH_OUT**: Ball predicted rest point inside defensive area (rest_x < area_x(own-2.8) - rush_margin(0.8 enter/0.3 exit), abs(y) ≤ 2.2) → rush out to clear. Uses `gk_state_confirm_frames=2` to enter, `gk_state_release_frames=4` to exit.
+1. **GUARD** (default): Arc-based positioning via `goalkeeper_guard_target` formula — intersection of ball→goal-center line with arc at depth=1.3m, R and depth dynamically scaled by ball distance (full at close range, 0.6× at far). Face ball always.
+2. **RUSH_OUT**: Ball predicted rest point near goal line (rest_x < own_goal_x + `gk_rush_out_max_dist_m(1.5)`) AND inside defensive area (rest_x < area_x - rush_margin, abs(y) ≤ 2.2) → rush out to clear. Before entering, checks `_gk_teammate_is_closer` — if an outfielder can reach the ball first, defers to GUARD. Two-stage approach:
+   - **Stage far** (distance > 0.5m): run directly at predicted rest point facing direction of travel; `wants_to_kick()` returns False.
+   - **Stage near** (≤ 0.5m): slide behind ball (opposite kick direction) and face clearance; `wants_to_kick()` evaluates.
+   Uses `gk_state_confirm_frames=2` to enter, `gk_state_release_frames=4` to exit.
 3. **LATERAL**: Ball predicted to cross goal line inside posts → slide along goal depth line. Minimum hold time `gk_lateral_hold_min_sec=0.8s`.
-4. **DESPERATION**: ball.x < own_goal_x(-7.0) + gk_desperation_clear_margin_m(1.5) = -5.5 → direct rush at ball with offset=0.2m, kick_theta=0.0, always wants_to_kick.
 
-Ball friction model: exponential decay v(t)=v0*exp(-mu*t), mu online-updated (0.9*old+0.1*decel, clamped[0.01,5.0]). Max horizon=2.0s, goal crossing max search=6.0s.
+Ball friction model: exponential decay v(t)=v0*exp(-mu*t), mu online-updated with adaptive rate (0.7/0.3 first 30 frames, 0.9/0.1 after, clamped[0.01,5.0]). Max horizon=2.0s, goal crossing max search=6.0s.
 
 ### select_chaser Algorithm (4-step, evaluated every frame)
 
@@ -253,16 +255,19 @@ No global path planning. Computes velocity every frame from current obstacle lay
 - challenge_area_x_ratio=0.20, challenge_area_y=2.2, challenge_hysteresis_m=0.30
 - clear_hold_sec=1.5, rush_speed_multiplier=2.2, kick_power=3.5, lateral_speed=1.0
 - guard_arc_radius=1.4, guard_depth_m=1.3, rush_speed_ratio=0.8
-- desperation_clear_margin_m=1.5
+- gk_rush_out_max_dist_m=1.5 (replaces old desperation_clear_margin_m)
 
 ### GK State Machine
 - confirm_frames=2, release_frames=4, target_smooth_speed=2.0
 - rush_out_margin_m=0.8, rush_out_exit_margin_m=0.3
+- rush_out_max_dist_m=1.5 (replaces desperation_clear_margin_m)
 - lateral_hold_min_sec=0.8
 - gk_state_confirm_frames=2 (enter RUSH_OUT), gk_state_release_frames=4 (exit RUSH_OUT)
 
 ### Ball Prediction
-- history_size=10, kp=0.6, ki=0.05, kd=0.1, friction_init=0.3, max_horizon_sec=2.0
+- history_size=20, kp=0.6, ki=0.05, kd=0.1, friction_init=0.3, max_horizon_sec=2.0
+- Velocity: 3-frame diff + friction compensation (consistent with exponential decay model)
+- Friction: adaptive rate (fast 0.3 first 30 frames, stable 0.1 after)
 
 ### Sideline / Goal Line Recovery
 - recovery_margin_m=0.90, infield_m=1.60, advance_m=0.75, goal_line_margin_m=0.15
@@ -353,8 +358,8 @@ See `.omo/docs/strategy-framework-analysis.md` (comprehensive architecture doc) 
 2. **Reactive avoidance deadlocks in dense play** — no path-planning layer; multiple obstacles in a narrow gap cause oscillating via-points.
 3. **Chaser ignores opponent goalie** — `ball_claim_score` only considers distance+slot bias, does not account for opponent goalkeeper position when chasing near opponent goal.
 4. ~~**Supporter ignores opponent robots**~~ **(RESOLVED 2026-07)** — `_spaced_support_target` now applies a second push-out pass from the nearest opponent at `support_opponent_avoid_radius_m`(0.6m), via the shared `_push_out_from` helper. Also fixed the orbit-instability root cause: in-band + within `support_angle_hold_deadzone` the supporter holds its pose (`_chaser_relative_target`), and `SupporterRole._smooth_target` rate-limits the target (`support_target_smooth_speed`). Distance bounds de-hardcoded to `support_min/max_distance_m` (max 2.8→2.2). See `docs/strategy-evaluation.md` §8.0/8.1/8.3.
-5. **GK desperation clears into empty net** — approach_offset=0.2m, kick_theta=0.0 (straight toward opponent), no check if goalie is between ball and our goal.
-6. **Ball prediction history too short** — 10 frames at 30Hz = 0.33s, insufficient for goal-crossing prediction.
+5. ~~**GK desperation clears into empty net**~~ **(RESOLVED 2026-07)** — desperation removed; replaced by `gk_rush_out_max_dist_m(1.5)` max-dist filter + `_gk_teammate_is_closer` deferral. RUSH_OUT now has a two-stage approach (far→near) with stage-1 `wants_to_kick()` guard. GK guard arc radius/depth dynamically scale with ball distance. See `docs/strategy-evaluation.md` §9.
+6. ~~**Ball prediction history too short**~~ **(RESOLVED 2026-07)** — history_size increased 10→20 (0.33→0.67s). Least-squares regression (constant-velocity assumption) replaced with 3-frame difference + friction compensation, consistent with the exponential friction model. Friction adaptation uses dual-rate (0.3 first 30 frames, 0.1 after) for faster convergence. `_MAX_REST_DISTANCE` reduced 20→16m.
 7. **GK target speed limit defeated** — `gk_target_smooth_speed=2.0` but actual RUSH_OUT commands use `speed_multiplier=2.2`, and the speed limit only applies to the target smoothing, not the movement command.
 8. ~~**Keeper-as-chaser leaves no outfield chaser**~~ **(RESOLVED 2026-07)** — when ball is in danger zone and `select_chaser` returns the goalkeeper (KEEPER eligible in danger zone), `assign_roles`'s goalkeeper-first check left no player with ROLE_CHASER → both outfielders became SUPPORTER, mutual-referenced → drifted to sideline. Fix: `RoleAssignment` carries `chaser_id`/`goalkeeper_id`; `SupporterRole.target` uses real chaser_id; when `chaser_id == goalkeeper_id`, outfielders split into **cover** (ball→goal line) and **outlet** (upfield). See `docs/strategy-evaluation.md` §13 Phase 1.
 9. ~~**Chaser shoots from own half; shoot/dribble oscillation**~~ **(RESOLVED 2026-07)** — added zone gate (`shoot_min_ball_x_m`/`shoot_max_distance_m`) and `was_dribbling` hysteresis (`shoot_enter_from_dribble_score`). See §13 Phase 2.

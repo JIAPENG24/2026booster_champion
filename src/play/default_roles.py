@@ -744,6 +744,10 @@ class GoalkeeperRole(RoleStrategy):
         # Logging
         self._state_logged = False
         self._last_kick_dir_index = -1
+        # Per-event throttle timestamps (seconds since epoch) for high-density logs
+        self._last_log_throttle: dict[str, float] = {}
+        # Rush approach stage: "far" (running toward ball) vs "near" (positioning to kick)
+        self._rush_approach_stage: str = "far"
         # Trajectory smoothing
         self._smooth_x = 0.0
         self._smooth_y = 0.0
@@ -817,6 +821,26 @@ class GoalkeeperRole(RoleStrategy):
             rush_margin = strat.gk_rush_out_margin_m
         rush_cond = rest_x < area_x - rush_margin and abs(rest_y) <= area_y
 
+        # When entering RUSH_OUT (not already in it), additionally require
+        # the predicted rest point to be near the goal line (within
+        # gk_rush_out_max_dist_m).  This prevents the GK from rushing for
+        # balls that are still far from the goal — outfield players can
+        # handle those.  Combined with the teammate-intercept check below,
+        # this replaces the old desperation override.
+        if rush_cond and self._gk_state != self._RUSH_OUT:
+            rush_max_x = kit.field.own_goal_x() + strat.gk_rush_out_max_dist_m
+            if not (rest_x < rush_max_x):
+                rush_cond = False
+                self._gk_log_throttled(
+                    "penalty_area", kit.logger,
+                    f"GK rush blocked by max-dist filter: "
+                    f"rest_pred=({rest_x:.3f},{rest_y:.3f}) "
+                    f"max_x={rush_max_x:.3f}",
+                    event="gk_rush_blocked_penalty_area",
+                    rest_x=round(rest_x, 3), rest_y=round(rest_y, 3),
+                    penalty_area_x=round(rush_max_x, 3),
+                )
+
         # LATERAL: ball predicted to cross goal line within posts
         goal_x = kit.field.own_goal_x()
         goal_hw = kit.config.goal_width / 2.0
@@ -827,7 +851,22 @@ class GoalkeeperRole(RoleStrategy):
         if lateral_cond:
             desired = self._LATERAL
         elif rush_cond:
-            desired = self._RUSH_OUT
+            # Before committing to RUSH_OUT (only on entry, not while already
+            # rushing), defer to an outfield teammate that is clearly closer
+            # to the predicted rest point and can intercept the ball.
+            if self._gk_state != self._RUSH_OUT and self._gk_teammate_is_closer(
+                rest_x, rest_y, kit, context, extra_margin=0.2,
+            ):
+                desired = self._GUARD
+                self._gk_log_throttled(
+                    "teammate_block", kit.logger,
+                    f"GK rush blocked by teammate intercept: "
+                    f"rest_pred=({rest_x:.3f},{rest_y:.3f})",
+                    event="gk_rush_blocked_teammate",
+                    rest_x=round(rest_x, 3), rest_y=round(rest_y, 3),
+                )
+            else:
+                desired = self._RUSH_OUT
         else:
             desired = self._GUARD
 
@@ -900,6 +939,62 @@ class GoalkeeperRole(RoleStrategy):
                 reason=reason,
             )
 
+    def _gk_teammate_is_closer(
+        self,
+        target_x: float,
+        target_y: float,
+        kit: "SoccerKit",
+        context: PlayContext,
+        extra_margin: float = 0.0,
+    ) -> bool:
+        """Whether an outfield teammate is closer to (target_x,target_y) than the GK.
+
+        Returns ``True`` when a non-penalised teammate is sufficiently closer
+        (by ``extra_margin`` metres) to the target, meaning the GK should defer.
+        """
+        gk_id = kit.config.goalkeeper_player_id()
+        game = context.known_game
+        robot = context.teammates.get(gk_id)
+        if robot is None or robot.pose is None:
+            return False
+        gk_dist = math.hypot(target_x - robot.pose.x, target_y - robot.pose.y)
+
+        for tid, trobot in context.teammates.items():
+            if (
+                tid == gk_id
+                or trobot.pose is None
+                or not kit.is_player_allowed(game, tid)
+            ):
+                continue
+            teammate_dist = math.hypot(
+                target_x - trobot.pose.x, target_y - trobot.pose.y,
+            )
+            if teammate_dist < gk_dist - extra_margin:
+                return True
+        return False
+
+    def _gk_log_throttled(
+        self,
+        key: str,
+        logger: object,
+        message: str,
+        min_interval_sec: float = 1.0,
+        **kwargs,
+    ) -> bool:
+        """Log at most once per ``min_interval_sec`` per ``key``.
+
+        Returns ``True`` if the message was actually emitted (i.e. the
+        throttle gate opened), ``False`` if it was suppressed.
+        """
+        now = time.time()
+        last = self._last_log_throttle.get(key, -1e9)
+        if now - last < min_interval_sec:
+            return False
+        self._last_log_throttle[key] = now
+        if logger is not None:
+            logger.info(message, **kwargs)
+        return True
+
     # ------------------------------------------------------------------
     # Public RoleStrategy interface
     # ------------------------------------------------------------------
@@ -912,28 +1007,23 @@ class GoalkeeperRole(RoleStrategy):
         self._ensure_updated(kit, context)
         ball = context.known_ball
 
-        # Desperation: ball critically close to goal line — approach ball
-        # directly, bypassing state machine target (which may be lateral
-        # block or guard and would prevent reaching the ball).
-        margin = kit.config.strategy.gk_desperation_clear_margin_m
-        own_goal_x = kit.field.own_goal_x()
-        if ball.x < own_goal_x + margin:
-            raw = kit.motion.approach_target(ball, 0.0, 0.2)
-            logger = kit.logger
-            if logger is not None:
-                logger.info(
-                    f"GK desperation approach ball=({ball.x:.3f},{ball.y:.3f})",
-                    event="goalkeeper_desperation_approach",
-                    ball_x=round(ball.x, 3), ball_y=round(ball.y, 3),
-                )
-            return self._smooth_target(raw, kit)
-
         if self._gk_state == self._RUSH_OUT:
             raw = self._rush_out_target(kit, context, ball)
         elif self._gk_state == self._LATERAL:
             raw = self._lateral_target(kit, context, ball)
         else:
             raw = kit.ready_stance.goalkeeper_guard_target(ball)
+            if not self._state_logged:
+                self._state_logged = True
+                logger = kit.logger
+                if logger is not None:
+                    logger.info(
+                        f"GK GUARD target=({raw.x:.3f},{raw.y:.3f}) "
+                        f"ball_dist={math.hypot(ball.x - kit.field.own_goal_x(), ball.y):.2f}",
+                        event="goalkeeper_guard",
+                        target_x=round(raw.x, 3), target_y=round(raw.y, 3),
+                        ball_dist=round(math.hypot(ball.x - kit.field.own_goal_x(), ball.y), 2),
+                    )
 
         return self._smooth_target(raw, kit)
 
@@ -943,18 +1033,18 @@ class GoalkeeperRole(RoleStrategy):
         context: PlayContext,
     ) -> bool:
         self._ensure_updated(kit, context)
-        ball = context.known_ball
-        margin = kit.config.strategy.gk_desperation_clear_margin_m
-
-        # Desperation clear always overrides — last line of defence.
-        if ball is not None and ball.x < kit.field.own_goal_x() + margin:
-            return True
 
         if self._gk_state != self._RUSH_OUT:
             return False
 
-        # Even in RUSH_OUT, defer if an outfield teammate is closer to the
+        # Don't kick while still in the approach (stage 1) phase — the GK
+        # needs to reach the ball first and get behind it.
+        if self._rush_approach_stage == "far":
+            return False
+
+        # Even in RUSH_OUT (stage 2), defer if an outfield teammate is closer to the
         # ball (avoids GK–chaser double-kick contention).
+        ball = context.known_ball
         gk_id = kit.config.goalkeeper_player_id()
         game = context.known_game
         robot = context.teammates.get(gk_id)
@@ -986,12 +1076,6 @@ class GoalkeeperRole(RoleStrategy):
 
         clear_x = kit.field.opponent_goal_x() - 0.7
         own_goal_x = kit.field.own_goal_x()
-
-        # Desperation clear: ball within margin of goal line — kick as far as
-        # possible toward the opponent goal, ignoring direction optimisation.
-        desperation_margin = kit.config.strategy.gk_desperation_clear_margin_m
-        if ball.x < own_goal_x + desperation_margin:
-            return Pose2D(kit.field.opponent_goal_x(), 0.0, kit.field.attack_theta())
 
         # Defensive fallback if predictor not yet initialised
         if self._predictor is None:
@@ -1038,13 +1122,12 @@ class GoalkeeperRole(RoleStrategy):
             if logger is not None:
                 logger.info(
                     f"GK kick dir: {dir_name} "
-                    f"ball=({ball.x:.3f},{ball.y:.3f}) "
-                    f"robot_theta={robot.pose.theta:.2f}",
-                    event="goalkeeper_kick_direction",
-                    direction=dir_name,
-                    ball_x=round(ball.x, 3), ball_y=round(ball.y, 3),
-                    robot_theta=round(robot.pose.theta, 2),
-                )
+                    f"ball=({ball.x:.3f},{ball.y:.3f})",
+                event="goalkeeper_kick_direction",
+                direction=dir_name,
+                ball_x=round(ball.x, 3), ball_y=round(ball.y, 3),
+                # robot_theta=round(robot.pose.theta, 2),
+            )
 
         return Pose2D(candidates[self._last_kick_dir_index][0],
                       candidates[self._last_kick_dir_index][1],
@@ -1060,16 +1143,51 @@ class GoalkeeperRole(RoleStrategy):
         context: PlayContext,
         ball: BallState,
     ) -> Pose2D:
-        """Approach the predicted rest point to intercept and clear."""
+        """Approach the predicted rest point to intercept and clear.
+
+        Two-stage approach:
+
+        1. **Far** (*rush_approach_stage="far"*, distance > 0.5 m):
+           Run directly toward the predicted rest point, facing the
+           direction of travel.  The kick-stage position (behind the
+           ball) is only assumed at the last moment.
+
+        2. **Near** (*rush_approach_stage="near"*, distance ≤ 0.5 m):
+           Slide behind the ball (opposite the optimised kick direction)
+           and face the clearance direction.
+        """
         rest_x, rest_y = self._predictor.predict_rest_point()
 
-        kt = self.kick_target(kit, context)
-        kick_theta = math.atan2(kt.y - rest_y, kt.x - rest_x)
-        target = kit.motion.approach_target(
-            BallState(x=rest_x, y=rest_y, last_seen_at=ball.last_seen_at),
-            kick_theta,
-            self._APPROACH_OFFSET,
-        )
+        gk_id = kit.config.goalkeeper_player_id()
+        gk_robot = context.teammates.get(gk_id)
+        dist_to_rest = float("inf")
+        if gk_robot is not None and gk_robot.pose is not None:
+            dist_to_rest = math.hypot(
+                rest_x - gk_robot.pose.x, rest_y - gk_robot.pose.y,
+            )
+
+        _NEAR_THRESHOLD = 0.5  # switch to kick-positioning stage (m)
+
+        if dist_to_rest > _NEAR_THRESHOLD:
+            # Stage 1 — far: approach the predicted rest point directly,
+            # facing toward it so the GK runs naturally.
+            self._rush_approach_stage = "far"
+            face_theta = math.atan2(
+                rest_y - gk_robot.pose.y, rest_x - gk_robot.pose.x,
+            ) if gk_robot is not None and gk_robot.pose is not None else 0.0
+            target = Pose2D(rest_x, rest_y, face_theta)
+        else:
+            # Stage 2 — near: get behind the ball and face the optimised
+            # kick direction for the clearance.
+            self._rush_approach_stage = "near"
+            kt = self.kick_target(kit, context)
+            kick_theta = math.atan2(kt.y - rest_y, kt.x - rest_x)
+            target = kit.motion.approach_target(
+                BallState(x=rest_x, y=rest_y, last_seen_at=ball.last_seen_at),
+                kick_theta,
+                self._APPROACH_OFFSET,
+            )
+
         target = kit.field.clamp_from_goal_obstructions(target)
 
         logger = kit.logger
@@ -1083,16 +1201,14 @@ class GoalkeeperRole(RoleStrategy):
             logger.info(
                 f"GK rush-out plan: dir={dir_name} "
                 f"ball=({ball.x:.3f},{ball.y:.3f}) "
-                f"rest_pred=({rest_x:.3f},{rest_y:.3f}) "
-                f"ball_v=({self._predictor.smooth_vx:.2f},{self._predictor.smooth_vy:.2f}) "
-                f"mu={self._predictor.friction:.2f}",
+                f"rest_pred=({rest_x:.3f},{rest_y:.3f})",
                 event="goalkeeper_rush_out",
                 direction=dir_name,
                 ball_x=round(ball.x, 3), ball_y=round(ball.y, 3),
                 rest_x=round(rest_x, 3), rest_y=round(rest_y, 3),
-                ball_vx=round(self._predictor.smooth_vx, 2),
-                ball_vy=round(self._predictor.smooth_vy, 2),
-                friction=round(self._predictor.friction, 2),
+                # ball_vx=round(self._predictor.smooth_vx, 2),
+                # ball_vy=round(self._predictor.smooth_vy, 2),
+                # friction=round(self._predictor.friction, 2),
             )
 
         return target

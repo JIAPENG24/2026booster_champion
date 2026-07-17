@@ -217,7 +217,7 @@ class SoccerStrategyTuning:
     goalkeeper_rush_speed_ratio: float = 0.8  #  Rush-speed estimation ratio for prediction (×rush_speed_multiplier).
 
     # Ball trajectory prediction
-    ball_prediction_history_size: int = 10  #  Number of recent ball samples for velocity regression.
+    ball_prediction_history_size: int = 20  #  Number of recent ball samples for velocity regression.
     ball_prediction_kp: float = 0.6  #  PID proportional gain for velocity smoothing.
     ball_prediction_ki: float = 0.05  #  PID integral gain for velocity smoothing.
     ball_prediction_kd: float = 0.1  #  PID derivative gain for velocity smoothing.
@@ -251,8 +251,8 @@ class SoccerStrategyTuning:
     gk_target_smooth_speed: float = 2.0  #  Max target position change rate for trajectory smoothing (m/s).
     gk_rush_out_margin_m: float = 0.8  #  Entry margin for RUSH_OUT: predicted rest_x must be this deep inside area (m).
     gk_rush_out_exit_margin_m: float = 0.3  #  Exit margin for RUSH_OUT: rest_x must be this close to area boundary to exit (m).
+    gk_rush_out_max_dist_m: float = 1.5  #  Max predicted rest-point distance from goal line (m) for RUSH_OUT entry.
     gk_lateral_hold_min_sec: float = 0.8  #  Minimum time in LATERAL state before allowing transition away (s).
-    gk_desperation_clear_margin_m: float = 1.5  #  Ball-to-goal-line distance below which GK uses desperation clear (m).
 
     # Sideline and goal-line recovery
     sideline_recovery_margin_m: float = 0.90  #  Sideline distance threshold for recovery.

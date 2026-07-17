@@ -1,15 +1,16 @@
 """Ball trajectory prediction with PID-smoothed velocity estimation and friction-based extrapolation.
 
-Velocity is estimated via least-squares linear regression over the last N position
-samples (more robust to noise than 2-point differencing), then smoothed with a PID
-filter that drives the estimate toward the measured value.  Trajectory extrapolation
+Velocity is estimated from a 3-frame difference with friction compensation
+(consistent with the exponential friction model, unlike the old least-squares
+regression which assumed constant velocity), then smoothed with a PID filter
+that drives the estimate toward the measured value.  Trajectory extrapolation
 uses an exponential friction model::
 
     v(t) = v0 * exp(-mu * t)
     x(t) = x0 + (v0 / mu) * (1 - exp(-mu * t))
 
 The friction coefficient ``mu`` is estimated online from deceleration patterns in the
-ball's velocity history.
+ball's velocity history, with an adaptive update rate (fast initially, stable after).
 """
 
 from __future__ import annotations
@@ -52,11 +53,11 @@ class BallPredictor:
     _MU_CLAMP_MAX = 5.0  # friction coefficient upper bound
     _SPEED_THRESHOLD = 0.3  # below this speed (m/s), friction estimation is skipped
     _TIME_EPS = 1e-6  # minimum time delta for valid velocity computation
-    _MAX_REST_DISTANCE = 20.0  # clamp rest-point prediction to this radius (m)
+    _MAX_REST_DISTANCE = 16.0  # clamp rest-point prediction to this radius (m); field_length(14)+2
 
     def __init__(
         self,
-        history_size: int = 10,
+        history_size: int = 20,
         kp: float = 0.6,
         ki: float = 0.05,
         kd: float = 0.1,
@@ -83,6 +84,9 @@ class BallPredictor:
         self._prev_error_vy: float = 0.0
         self._prev_time: float = 0.0
 
+        # Friction adaptation counter (adaptive rate: fast initially, stable later)
+        self._update_count: int = 0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -99,6 +103,7 @@ class BallPredictor:
         self._prev_error_vx = 0.0
         self._prev_error_vy = 0.0
         self._prev_time = 0.0
+        self._update_count = 0
 
     def update(self, x: float, y: float, timestamp: float) -> None:
         """Add a new ball sample and recompute smoothed velocity/acceleration."""
@@ -279,34 +284,55 @@ class BallPredictor:
     # ------------------------------------------------------------------
 
     def _regress_velocity(self) -> tuple[float, float]:
-        """Compute velocity via least-squares linear regression on position history.
+        """Estimate instantaneous velocity using a 3-frame difference with
+        friction compensation.
 
-        For N samples ``(t_i, x_i)`` the regression slope is::
+        Replaces the old least-squares regression (which assumed constant
+        velocity, contradicting the friction model).  Uses the last 3
+        positions to compute an average velocity, then compensates for
+        exponential friction decay over the interval::
 
-            v = sum((t_i - t_mean)(x_i - x_mean)) / sum((t_i - t_mean)^2)
+            v(t1) = v_avg * mu*dt / (exp(mu*dt) - 1)
+
+        This recovers the instantaneous velocity at the latest timestamp
+        under the model ``v(t) = v0 * exp(-mu*t)``.
         """
         n = len(self._history)
-        if n < 2:
+        if n < 3:
+            if n < 2:
+                return 0.0, 0.0
+            # Fall back to 2-point difference for the first sample
+            x0, y0, t0 = self._history[-2]
+            x1, y1, t1 = self._history[-1]
+            dt = t1 - t0
+            if dt < self._TIME_EPS:
+                return 0.0, 0.0
+            return (x1 - x0) / dt, (y1 - y0) / dt
+
+        x0, y0, t0 = self._history[-3]
+        x1, y1, t1 = self._history[-1]
+        dt = t1 - t0
+        if dt < self._TIME_EPS:
             return 0.0, 0.0
 
-        xs = [s[0] for s in self._history]
-        ys = [s[1] for s in self._history]
-        ts = [s[2] for s in self._history]
+        # Average velocity over the 3-frame window
+        vx_avg = (x1 - x0) / dt
+        vy_avg = (y1 - y0) / dt
 
-        t_mean = sum(ts) / n
-        t_centered = [t - t_mean for t in ts]
+        # Friction compensation:
+        # Under v(t)=v0*exp(-mu*t), the average velocity over [t0, t1] is:
+        #   v_avg = v0 * (1-exp(-mu*dt)) / (mu*dt)
+        # Instantaneous velocity at t1 is v(t1) = v0 * exp(-mu*dt), so:
+        #   v(t1) = v_avg * mu*dt * exp(-mu*dt) / (1-exp(-mu*dt))
+        #          = v_avg * mu*dt / (exp(mu*dt) - 1)
+        mu = max(self._mu, self._MU_CLAMP_MIN)
+        exp_mu_dt = math.exp(mu * dt)
+        if exp_mu_dt > 1.001:
+            comp = mu * dt / (exp_mu_dt - 1.0)
+            vx_avg *= comp
+            vy_avg *= comp
 
-        denom = sum(tc * tc for tc in t_centered)
-        if denom < self._TIME_EPS:
-            return 0.0, 0.0
-
-        x_mean = sum(xs) / n
-        y_mean = sum(ys) / n
-
-        vx = sum(tc * (x - x_mean) for tc, x in zip(t_centered, xs)) / denom
-        vy = sum(tc * (y - y_mean) for tc, y in zip(t_centered, ys)) / denom
-
-        return vx, vy
+        return vx_avg, vy_avg
 
     def _update_friction(self) -> None:
         """Estimate friction coefficient from velocity decay.
@@ -329,7 +355,10 @@ class BallPredictor:
             return
 
         if self._MU_CLAMP_MIN <= decel <= self._MU_CLAMP_MAX:
-            self._mu = 0.9 * self._mu + 0.1 * decel
+            self._update_count += 1
+            # Fast convergence during the first 30 frames, then stable
+            rate = 0.3 if self._update_count < 30 else 0.1
+            self._mu = (1.0 - rate) * self._mu + rate * decel
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
