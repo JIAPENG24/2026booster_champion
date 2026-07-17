@@ -136,11 +136,32 @@ class GoReadyTarget(_ActionLeaf):
 
         assignment = self.blackboard.read(BlackboardKeys.READY_TARGETS)
         if assignment is None:
+            team_id = self._kit.config.team_id
             available_ids = [
                 pid for pid in self._kit.config.player_ids
-                if game.is_active_player(self._kit.config.team_id, pid)
+                if game.is_active_player(team_id, pid)
             ]
-            is_own = game.is_restart_for_team(self._kit.config.team_id)
+            is_own = game.is_restart_for_team(team_id)
+            logger = self._kit.logger
+            if logger is not None:
+                active_map = {
+                    str(pid): game.is_active_player(team_id, pid)
+                    for pid in self._kit.config.player_ids
+                }
+                logger.info(
+                    f"ready diagnose available={available_ids} "
+                    f"is_own={is_own} active_map={active_map}",
+                    event="ready_diagnose",
+                    console=(not available_ids),
+                    state=game.state.value,
+                    kicking_team=game.kicking_team,
+                    team_id=team_id,
+                    available=available_ids,
+                    is_own=is_own,
+                    active_map=active_map,
+                )
+            if not available_ids:
+                available_ids = list(self._kit.config.player_ids)
             assignment = self._kit.ready_stance.ready_targets_for(
                 available_ids, is_own,
             )
