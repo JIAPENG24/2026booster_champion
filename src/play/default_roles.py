@@ -657,6 +657,7 @@ class SupporterRole(RoleStrategy):
                 hold_vyaw=0.25,
                 strafe=True,
                 speed_multiplier=2.0,
+                lateral_speed=1.0,
                 kick_power=2.5,
             ),
         )

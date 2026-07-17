@@ -46,6 +46,92 @@ __all__ = [
 PlayerAllowed = Callable[[GameControlState, int], bool]
 
 
+# Goalkeeper-aware shooting helpers (issue 5.3)
+_GK_SHOOT_PENALTY_WEIGHT: float = 0.4
+    #  Weight for goalkeeper proximity penalty when scoring shoot candidates.
+_GK_PENALTY_DIST_M: float = 1.5
+    #  Distance (m) at which goalkeeper proximity penalty reaches zero.
+
+
+def _identify_opponent_goalkeeper(
+    context: PlayContext, config: SoccerConfig,
+) -> Pose2D | None:
+    """Return opponent goalkeeper's pose, or None if unavailable."""
+    game = context.game
+    if game is None:
+        return None
+    opponent_team = game.get_team_state(config.opponent_team_id())
+    if opponent_team is None:
+        return None
+    gk_id = opponent_team.goalkeeper
+    if gk_id <= 0:
+        return None
+    gk_robot = context.opponents.get(gk_id)
+    if gk_robot is None or gk_robot.pose is None:
+        return None
+    return gk_robot.pose
+
+
+def _gk_proximity_penalty(candidate: Pose2D, gk_pose: Pose2D) -> float:
+    """Return penalty in [0, 1]: 1 when candidate coincides with goalkeeper position."""
+    dist = math.hypot(candidate.x - gk_pose.x, candidate.y - gk_pose.y)
+    return clamp(1.0 - dist / _GK_PENALTY_DIST_M, 0.0, 1.0)
+
+
+def _goal_candidates(field: TeamFieldFrame, goal_half: float) -> list[Pose2D]:
+    """Generate shoot candidate targets across the opponent goal mouth.
+
+    Three candidates: slightly inside each post and center. Aims just inside
+    the posts (minus 0.10 m inset) to keep the ball inside the goal frame.
+    """
+    gx = field.opponent_goal_x()
+    post_inset = goal_half - 0.10
+    return [
+        Pose2D(gx, -post_inset, 0.0),
+        Pose2D(gx, 0.0, 0.0),
+        Pose2D(gx, post_inset, 0.0),
+    ]
+
+
+def _best_shoot_target(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    obstacles: ObstacleCollector,
+    context: PlayContext,
+    *,
+    lane_ema: float | None = None,
+) -> tuple[Pose2D, float]:
+    """Evaluate all goal-mouth candidates and return (best_target,best_score).
+
+    Applies GK proximity penalty so the shooter aims away from the opponent
+    goalkeeper when possible.  When GK pose is unavailable, falls back to
+    pure lane-clearance scoring (identical to the old single-candidate behavior).
+    """
+    gk_pose = _identify_opponent_goalkeeper(context, config)
+    ball = context.known_ball
+    goal_half = config.goal_width / 2.0
+    candidates = _goal_candidates(field, goal_half)
+    best_score = -1.0
+    best_target = candidates[1]
+    for target in candidates:
+        raw = lane_clear_score(
+            config,
+            ball.x, ball.y,
+            target.x, target.y,
+            obstacles.opponent_obstacles(context),
+        )
+        penalty = 0.0
+        if gk_pose is not None:
+            penalty = _gk_proximity_penalty(target, gk_pose)
+        score = raw - penalty * _GK_SHOOT_PENALTY_WEIGHT
+        if score > best_score:
+            best_score = score
+            best_target = target
+    if lane_ema is not None:
+        best_score = max(best_score, lane_ema * 0.8)
+    return best_target, best_score
+
+
 # Top-level selection
 
 
@@ -97,7 +183,10 @@ def select_kick_target(
         was_shooting=was_shooting, was_dribbling=was_dribbling,
         lane_ema=lane_ema,
     ):
-        return Pose2D(field.opponent_goal_x(), 0.0, 0.0), "shoot"
+        best_target, _ = _best_shoot_target(
+            config, field, obstacles, context, lane_ema=lane_ema,
+        )
+        return best_target, "shoot"
 
     teammate = best_pass_target(
         config, obstacles,
@@ -221,6 +310,10 @@ def shot_lane_is_clear(
 ) -> bool:
     """Treat a shot lane as shootable with hysteresis to prevent oscillation.
 
+    Evaluates all goal-mouth candidates (left-post, center, right-post) with
+    an opponent-goalkeeper proximity penalty so the shooter aims away from the
+    keeper.  The best candidate's score is compared against the threshold.
+
     Three thresholds, by previous decision:
       * already shooting      -> low threshold (stay shooting)
       * switching dribble→shoot -> high ``shoot_enter_from_dribble_score``
@@ -228,21 +321,13 @@ def shot_lane_is_clear(
         dribble, mirroring the existing shoot-side hold)
       * fresh entry           -> normal threshold
 
-    When ``lane_ema`` is provided, it replaces the raw ``lane_clear_score`` so
-    that the decision uses a temporally-smoothed value immune to single-frame
-    obstacle jitter (see :func:`select_kick_target`).
+    ``lane_ema`` provides a smoothed center-only floor so temporal smoothing
+    (ChaserRole's exponential moving average) still contributes stability.
     """
 
-    ball = context.known_ball
-    raw = lane_clear_score(
-        config,
-        ball.x,
-        ball.y,
-        field.opponent_goal_x(),
-        0.0,
-        obstacles.opponent_obstacles(context),
+    _, best_score = _best_shoot_target(
+        config, field, obstacles, context, lane_ema=lane_ema,
     )
-    score = lane_ema if lane_ema is not None else raw
     strategy = config.strategy
     if was_shooting:
         threshold = 0.25
@@ -250,7 +335,7 @@ def shot_lane_is_clear(
         threshold = strategy.shoot_enter_from_dribble_score
     else:
         threshold = 0.45
-    return score >= threshold
+    return best_score >= threshold
 
 
 def _shot_zone_allowed(

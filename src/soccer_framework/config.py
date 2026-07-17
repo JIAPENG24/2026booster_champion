@@ -69,7 +69,7 @@ class SoccerStrategyTuning:
     # Speed limits
     # Hard output clamps in the motion layer, tied to chassis stability and field friction.
     max_linear_speed: float = 0.8  #  Linear speed limit in m/s.
-    max_lateral_speed: float = 0.6  #  Lateral speed limit in m/s for strafe movement.
+    max_lateral_speed: float = 0.8  #  Lateral speed limit in m/s for strafe movement.
     max_angular_speed: float = 1.0  #  Angular speed limit in rad/s.
 
     # Kick hysteresis
@@ -202,7 +202,7 @@ class SoccerStrategyTuning:
     support_reengage_distance_m: float = 4.0  #  Beyond this supporter-to-chaser distance (m), drop the lateral triangle offset and beeline straight behind the chaser to close the gap faster.
 
     # Strafe motion
-    strafe_align_gate_rad: float = 1.2  #  Heading-error gate (rad) for strafe alignment; translation is fully suppressed at this error so the robot rotates to face the target first.
+    strafe_align_gate_rad: float = 2.5  #  Heading-error gate (rad) for strafe alignment; translation is fully suppressed at this error so the robot rotates to face the target first.
 
     # Goalkeeping and challenges
     goalkeeper_challenge_area_x_ratio: float = 0.20  #  X-axis ratio for defensive challenge area (field_length * ratio = area boundary).

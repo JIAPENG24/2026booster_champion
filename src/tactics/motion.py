@@ -17,9 +17,11 @@ PLAY and READY share walking parameters. The remaining phase difference is the
 from __future__ import annotations
 
 import math
+import time
 
 from ..soccer_framework import (
     BallState,
+    GameState,
     KickIntent,
     MoveIntent,
     Pose2D,
@@ -43,11 +45,17 @@ from .geometry import TeamFieldFrame
 # extra spinning in Ready; see note/motion_spinning_issue_analysis.md.
 _ARRIVE_DISTANCE = 0.15
 _ARRIVE_ANGLE = 0.20  # Relaxed to ~11.5 deg to avoid repeated micro-adjustments near target.
-_TURN_THRESHOLD = 0.5
+_TURN_THRESHOLD = 1.0
 _ANGULAR_SPEED_FLOOR = 0.25  # Lower floor to reduce overshoot for small angle errors.
 _ANGULAR_DEAD_ZONE = 0.15  # No floor below this angle error; pure proportional control.
 _LINEAR_SPEED_FLOOR = 0.3
 _LINEAR_GAIN = 2.0
+
+# Phase transition smoothing (issue 2.3)
+# When the game switches from READY to PLAYING, the robot's target jumps
+# from a static ready pose to a dynamic role target. The transition
+# interpolator blends the target over this duration to avoid sharp turns.
+_TRANSITION_DURATION_SEC = 0.3  # ~9 frames at 30 Hz
 
 
 class MotionController:
@@ -77,6 +85,9 @@ class MotionController:
         self._kicker = kicker
         self._obstacles = obstacles
         self._avoid_side_by_player: dict[int, float] = {}
+        # Phase transition smoothing (issue 2.3)
+        self._transition_start: dict[int, tuple[float, Pose2D]] = {}
+        self._last_game_state: GameState | None = None
 
     # Public interface
 
@@ -111,11 +122,24 @@ class MotionController:
         if robot is None or robot.pose is None:
             return RobotCommand.stop(f"{reason}: waiting for pose")
 
+        # Phase transition detection (issue 2.3)
+        self._detect_transition(context)
+
         # Path detour: compute via point
         adjusted_target = self._avoidance_target(player_id, robot.pose, target, context)
         adjusted_reason = (
             f"{reason} via obstacle" if adjusted_target != target else reason
         )
+
+        # Phase transition smoothing: linearly interpolate target over the first
+        # _TRANSITION_DURATION_SEC of PLAYING to avoid sharp direction changes
+        # from READY ready_target to the first PLAYING dynamic target.
+        smoothed_target = self._apply_transition_smoothing(
+            player_id, robot.pose, adjusted_target,
+        )
+        if smoothed_target != adjusted_target:
+            adjusted_target = smoothed_target
+            adjusted_reason = f"{reason} smooth"
 
         # Walking control: compute vx + vyaw (and vy when strafing)
         arrive_dist = _ARRIVE_DISTANCE if arrive_distance is None else arrive_distance
@@ -185,6 +209,55 @@ class MotionController:
                 theta=kick_theta,
             )
         )
+
+    # Phase transition smoothing (issue 2.3)
+
+    def _detect_transition(self, context: PlayContext) -> None:
+        """Track game-state transitions and record player start poses when READY→PLAYING fires.
+
+        Uses ``_last_game_state`` to detect the first transition frame and
+        snapshots all teammate poses into ``_transition_start`` so
+        :meth:`_apply_transition_smoothing` can blend from them.
+        """
+        game = context.game
+        if game is None:
+            return
+        current_state = game.state
+        if (
+            self._last_game_state == GameState.READY
+            and current_state == GameState.PLAYING
+        ):
+            now = time.monotonic()
+            for pid, robot in context.teammates.items():
+                if robot.pose is not None:
+                    self._transition_start[pid] = (now, robot.pose)
+        self._last_game_state = current_state
+
+    def _apply_transition_smoothing(
+        self,
+        player_id: int,
+        pose: Pose2D,
+        target: Pose2D,
+    ) -> Pose2D:
+        """Linearly interpolate from the transition-start pose toward target over ``_TRANSITION_DURATION_SEC``.
+
+        Returns the interpolated target during the transition window, or the
+        original target when the transition has expired (or was never started).
+        """
+        entry = self._transition_start.get(player_id)
+        if entry is None:
+            return target
+        t_start, start_pose = entry
+        elapsed = time.monotonic() - t_start
+        if elapsed >= _TRANSITION_DURATION_SEC:
+            self._transition_start.pop(player_id, None)
+            return target
+        alpha = elapsed / _TRANSITION_DURATION_SEC
+        ix = start_pose.x + (target.x - start_pose.x) * alpha
+        iy = start_pose.y + (target.y - start_pose.y) * alpha
+        dtheta = normalize_angle(target.theta - start_pose.theta)
+        it = start_pose.theta + dtheta * alpha
+        return Pose2D(ix, iy, it)
 
     # Path detour
 
