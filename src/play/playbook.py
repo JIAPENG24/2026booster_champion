@@ -25,6 +25,7 @@ from ..soccer_framework import PlayContext, ReadySlot, RobotCommand
 from ..runtime import SoccerKit
 
 if TYPE_CHECKING:
+    from ..soccer_framework import BallState
     from .role import RoleRegistry, RoleStrategy
 
 
@@ -46,9 +47,18 @@ class RoleAssignment:
 
     Use :meth:`players_of` for reverse lookup by role; specialized attributes
     such as chaser/supporters are intentionally not provided.
+
+    ``chaser_id`` / ``goalkeeper_id`` snapshot this tick's assigned chaser and
+    goalkeeper player IDs so downstream roles (e.g. the supporter) can anchor to
+    the **assigned** chaser instead of re-deriving it by scanning teammates.
+    When the goalkeeper is the assigned chaser (ball in the defensive area and
+    keeper is closest), ``chaser_id == goalkeeper_id`` — supporters detect this
+    and switch to fixed-field-reference danger-zone positioning.
     """
 
     by_player: Mapping[int, str] = field(default_factory=dict)
+    chaser_id: int | None = None
+    goalkeeper_id: int | None = None
 
     def __post_init__(self) -> None:
         # Freeze as a read-only view so external by_player edits cannot change ``role_of`` behavior.
@@ -182,12 +192,39 @@ class DefaultPlaybook(Playbook):
             self._last_perf_log_at = now
             self._log_performance(context, mapping, chaser_id, goalkeeper_id)
 
-        return RoleAssignment(mapping)
+        return RoleAssignment(
+            mapping, chaser_id=chaser_id, goalkeeper_id=goalkeeper_id,
+        )
 
     # Internals
 
     def _configured_goalkeeper(self) -> int | None:
         return self.kit.config.goalkeeper_player_id()
+
+    def _chaser_lock_defensive_x(self) -> float:
+        """Defensive-zone x boundary for the chaser lock ladder (issue 3.1).
+
+        Decoupled from the goalkeeper challenge area; driven by
+        ``chaser_lock_defensive_x_ratio``. Own-side, negative x.
+        """
+        config = self.kit.config
+        return -config.field_length * config.strategy.chaser_lock_defensive_x_ratio
+
+    def _chaser_lock_duration(self, ball: BallState) -> float:
+        """Dynamic chaser-lock duration (s) based on ball danger level.
+
+        Three tiers, from most to least dangerous:
+        - near own goal line (``< own_goal_x + 1.5``) -> 3.0 s
+        - inside defensive zone (``< defensive_x``)    -> 2.0 s
+        - otherwise                                    -> 1.5 s (config: chaser_lock_midfield_duration_s)
+        """
+        config = self.kit.config
+        own_goal_x = -config.field_length / 2.0  # -7.0
+        if ball.x < own_goal_x + 1.5:
+            return 3.0
+        if ball.x < self._chaser_lock_defensive_x():
+            return 2.0
+        return config.strategy.chaser_lock_midfield_duration_s
 
     def select_chaser(self, context: PlayContext) -> int:
         """Select this tick's chaser from our team.
@@ -239,19 +276,12 @@ class DefaultPlaybook(Playbook):
             chaser_id = min(tied_ids)
 
             # Dynamic lock duration based on ball danger level
-            own_goal_x = -config.field_length / 2.0  # -7.0
-            area_x = -config.field_length * config.strategy.goalkeeper_challenge_area_x_ratio
-            if ball.x < own_goal_x + 1.5:
-                lock_duration = 3.0   # very dangerous: near goal line
-            elif ball.x < area_x:
-                lock_duration = 2.0   # dangerous: in defensive area
-            else:
-                lock_duration = 0.5   # normal play
+            lock_duration = self._chaser_lock_duration(ball)
 
             # Refresh lock every tick while ball is in defensive area,
             # so the chaser never gets switched mid-approach.
             now = time.time()
-            if ball.x < area_x and self._last_chaser_id is not None:
+            if ball.x < self._chaser_lock_defensive_x() and self._last_chaser_id is not None:
                 min_lock = now + lock_duration
                 if self._chaser_lock_until < min_lock:
                     self._chaser_lock_until = min_lock
@@ -271,14 +301,7 @@ class DefaultPlaybook(Playbook):
 
         if chaser_id != self._last_chaser_id:
             now = time.time()
-            own_goal_x = -config.field_length / 2.0
-            area_x = -config.field_length * config.strategy.goalkeeper_challenge_area_x_ratio
-            if ball.x < own_goal_x + 1.5:
-                lock_duration = 3.0
-            elif ball.x < area_x:
-                lock_duration = 2.0
-            else:
-                lock_duration = 0.5
+            lock_duration = self._chaser_lock_duration(ball)
             self._chaser_lock_until = now + lock_duration
             self._last_chaser_id = chaser_id
             logger = self.kit.logger

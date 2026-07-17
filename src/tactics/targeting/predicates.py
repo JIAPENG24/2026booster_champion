@@ -81,7 +81,7 @@ def ball_near_sideline(config: SoccerConfig, ball: BallState) -> bool:
 def ball_is_in_midfield_or_own_half(config: SoccerConfig, ball: BallState) -> bool:
     """Whether the ball is around midfield or our half; SIDE uses this to decide whether to challenge."""
 
-    return ball.x < config.field_length * 0.20
+    return ball.x < config.field_length * config.strategy.midfield_boundary_x_ratio
 
 
 def sideline_sign(y: float) -> float:

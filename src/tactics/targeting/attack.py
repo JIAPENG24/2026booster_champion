@@ -58,12 +58,21 @@ def select_kick_target(
     is_player_allowed: PlayerAllowed,
     *,
     was_shooting: bool = False,
+    was_dribbling: bool = False,
+    lane_ema: float | None = None,
 ) -> tuple[Pose2D, str]:
     """Decide this tick's aim target for a center chaser.
 
     Decision order: sideline recovery, restart touch, clear shot lane, best pass,
     and finally dribble forward.  Shot lane uses hysteresis via ``was_shooting``
-    to prevent rapid shoot/dribble oscillation.
+    (stay) / ``was_dribbling`` (switch dribble→shoot needs a stronger lane) to
+    prevent rapid shoot/dribble oscillation. Shooting is also gated by ball
+    position (``shoot_min_ball_x_m`` / ``shoot_max_distance_m``) to avoid
+    low-percentage long shots from the own half.
+
+    ``lane_ema`` (optional) provides a temporally-smoothed lane score from the
+    caller (e.g. ChaserRole's exponential moving average) to suppress per-frame
+    noise in obstacle projections that causes shoot/dribble oscillation.
 
     Returns (target, decision) where decision is one of:
     ``"sideline"``, ``"restart"``, ``"shoot"``, ``"pass"``, ``"dribble"``.
@@ -83,7 +92,11 @@ def select_kick_target(
             return Pose2D(teammate.x, teammate.y, 0.0), "restart"
         return dribble_target(config, field, ball), "dribble"
 
-    if shot_lane_is_clear(config, field, obstacles, context, was_shooting=was_shooting):
+    if _shot_zone_allowed(config, field, ball) and shot_lane_is_clear(
+        config, field, obstacles, context,
+        was_shooting=was_shooting, was_dribbling=was_dribbling,
+        lane_ema=lane_ema,
+    ):
         return Pose2D(field.opponent_goal_x(), 0.0, 0.0), "shoot"
 
     teammate = best_pass_target(
@@ -203,15 +216,25 @@ def shot_lane_is_clear(
     context: PlayContext,
     *,
     was_shooting: bool = False,
+    was_dribbling: bool = False,
+    lane_ema: float | None = None,
 ) -> bool:
     """Treat a shot lane as shootable with hysteresis to prevent oscillation.
 
-    When not already shooting, lane_clear_score >= 0.55 is required to enter.
-    When already shooting, lane_clear_score >= 0.35 is sufficient to stay.
+    Three thresholds, by previous decision:
+      * already shooting      -> low threshold (stay shooting)
+      * switching dribble→shoot -> high ``shoot_enter_from_dribble_score``
+        (symmetric hysteresis so a single strong frame does not flip out of a
+        dribble, mirroring the existing shoot-side hold)
+      * fresh entry           -> normal threshold
+
+    When ``lane_ema`` is provided, it replaces the raw ``lane_clear_score`` so
+    that the decision uses a temporally-smoothed value immune to single-frame
+    obstacle jitter (see :func:`select_kick_target`).
     """
 
     ball = context.known_ball
-    score = lane_clear_score(
+    raw = lane_clear_score(
         config,
         ball.x,
         ball.y,
@@ -219,8 +242,36 @@ def shot_lane_is_clear(
         0.0,
         obstacles.opponent_obstacles(context),
     )
-    threshold = 0.25 if was_shooting else 0.45
+    score = lane_ema if lane_ema is not None else raw
+    strategy = config.strategy
+    if was_shooting:
+        threshold = 0.25
+    elif was_dribbling:
+        threshold = strategy.shoot_enter_from_dribble_score
+    else:
+        threshold = 0.45
     return score >= threshold
+
+
+def _shot_zone_allowed(
+    config: SoccerConfig,
+    field: TeamFieldFrame,
+    ball: BallState,
+) -> bool:
+    """Gate shooting by ball position to avoid low-percentage long shots.
+
+    Requires the ball to be at or beyond ``shoot_min_ball_x_m`` (attacking half
+    by default) AND within ``shoot_max_distance_m`` of the opponent goal. Shots
+    from the own half or from extreme range fall through to pass/dribble.
+    """
+
+    strategy = config.strategy
+    goal_x = field.opponent_goal_x()
+    dist_to_goal = math.hypot(goal_x - ball.x, 0.0 - ball.y)
+    return (
+        ball.x >= strategy.shoot_min_ball_x_m
+        and dist_to_goal <= strategy.shoot_max_distance_m
+    )
 
 
 def lane_clear_score(

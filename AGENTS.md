@@ -182,7 +182,7 @@ Ball friction model: exponential decay v(t)=v0*exp(-mu*t), mu online-updated (0.
 1. **Slot eligibility**: KEEPER only in danger zone. SIDE only when `side_should_challenge() = True` (midfield/own half always; attack zone only if side_dist+0.20 < center_dist).
 2. **Cost scoring**: `ball_claim_score(config, slot, pose, ball)` — distance-based with slot bias: KEEPER gets distance-0.75 in danger, distance+field_length otherwise; CENTER distance-0.20; SIDE distance-0.10.
 3. **Tie-breaking**: `teammate_challenge_tie_margin_m=0.15m` bandwidth; min player_id wins.
-4. **Dynamic chaser lock**: Prevents ping-pong. Lock durations: ball.x < own_x+1.5 → 3.0s; ball.x < area_x(-2.8) → 2.0s; else 0.5s. In defensive zone, lock refreshes every frame. If old chaser's score ≤ best+0.5, keep old chaser.
+4. **Dynamic chaser lock**: Prevents ping-pong. Lock durations: ball.x < own_x+1.5 → 3.0s; ball.x < `chaser_lock_defensive_x_ratio`(0.20→-2.8m) → 2.0s; else 0.5s. In defensive zone, lock refreshes every frame. If old chaser's score ≤ best+0.5, keep old chaser.
 
 ## MotionController — 3-Layer Reactive Controller
 
@@ -196,7 +196,7 @@ No global path planning. Computes velocity every frame from current obstacle lay
 ### Layer 2: Walk control (`_compute_velocity`)
 - Arrival check: distance<0.15m + angle<0.20rad → hold or stop
 - Near but misaligned: pure rotation
-- Strafe mode: vx=v*cos(err), vy=v*sin(err), per-axis clamped + heading correction
+- Strafe mode: vx=v*cos(err), vy=v*sin(err), per-axis clamped + heading correction; align_factor=max(0,1-|err|/strafe_align_gate_rad) scales vx/vy for heading priority (⪆1.2rad→pure rotation)
 - Non-strafe: angle_error>0.5rad → pure rotation; else vx=gain*distance*cos(err)*mult, vy=0, vyaw=angular_velocity(err)
 
 ### Layer 3: Yaw avoidance (`_apply_yaw_avoidance`)
@@ -235,9 +235,19 @@ No global path planning. Computes velocity every frame from current obstacle lay
 
 ### Ball Claim / Passing / Dribble / Support
 - teammate_challenge_tie_margin_m=0.15
+- chaser_lock_defensive_x_ratio=0.20 (chaser lock ladder defensive tier, decoupled from KEEPER area — issue 3.1)
+- midfield_boundary_x_ratio=0.20 (SIDE midfield/attack challenge boundary — issue 3.1)
 - pass_enabled=True, pass_min_score=0.60, pass_min_forward_m=0.35, pass_lane_clearance=0.75
 - dribble_advance_m=1.5, dribble_center_pull=0.65
-- support_depth_m=1.05, support_lateral_m=1.25, support_min_spacing_m=0.9
+- support_min_spacing_m=0.9, support_min_distance_m=1.0, support_max_distance_m=2.2, support_angle_hold_deadzone=0.35, support_opponent_avoid_radius_m=0.6, support_target_smooth_speed=2.5
+- support_danger_cover_depth_m=1.2, support_danger_outlet_forward_m=4.0, support_danger_outlet_lateral_m=2.0, support_reengage_distance_m=4.0
+- (deprecated, unused) support_depth_m=1.05, support_lateral_m=1.25
+
+### Shoot Decision
+- shoot_min_ball_x_m=0.0, shoot_max_distance_m=7.0, shoot_enter_from_dribble_score=0.65
+
+### Motion Strafe (Phase 3)
+- strafe_align_gate_rad=1.2
 
 ### Goalkeeper
 - challenge_area_x_ratio=0.20, challenge_area_y=2.2, challenge_hysteresis_m=0.30
@@ -292,11 +302,16 @@ All from `tactics/targeting/predicates.py`, first argument is always `config`.
 
 | Function | Condition | Threshold |
 |----------|-----------|-----------|
-| `ball_in_own_defensive_area(config, ball)` | ball.x < area_x AND abs(ball.y) ≤ area_y | area_x = -field_len*0.20 = -2.8m, area_y = min(width/2-0.35, 2.2) = 2.2m |
+| `ball_in_own_defensive_area(config, ball)` | ball.x < area_x AND abs(ball.y) ≤ area_y | area_x = -field_len*`goalkeeper_challenge_area_x_ratio`(0.20) = -2.8m, area_y = min(width/2-0.35, 2.2) = 2.2m |
 | `ball_beyond_goal_line(config, ball)` | abs(ball.x) > half_len + 0.15 | 7.15m |
 | `ball_beyond_own_goal_line(config, ball)` | ball.x < -7.15 | -7.15m |
 | `ball_near_sideline(config, ball)` | abs(ball.y) ≥ width/2 - 0.90 | 3.6m |
-| `ball_is_in_midfield_or_own_half(config, ball)` | ball.x < field_len * 0.20 | +2.8m |
+| `ball_is_in_midfield_or_own_half(config, ball)` | ball.x < field_len * `midfield_boundary_x_ratio`(0.20) | +2.8m |
+
+> Decoupling note (issue 3.1): the three field-zone ratios are independent params.
+> `goalkeeper_challenge_area_x_ratio` (KEEPER challenge area, -2.8m),
+> `chaser_lock_defensive_x_ratio` (chaser lock ladder defensive tier, -2.8m, see `play/default_roles.py`/`playbook.py`), and
+> `midfield_boundary_x_ratio` (SIDE challenge boundary, +2.8m) all default to 0.20 but can be tuned separately.
 
 ### Performance Log Zones (separate from predicates, used in `_log_performance`)
 - danger: ball.x < -3.5 (field_len*0.25)
@@ -309,7 +324,7 @@ All from `tactics/targeting/predicates.py`, first argument is always `config`.
 ### select_kick_target decision order (chaser/supporter)
 1. Sideline recovery (ball near sideline)
 2. Restart touch (our kickoff/set play, distance<0.45)
-3. Shot (lane_clear_score ≥ 0.45 enter / 0.25 hold, with was_shooting hysteresis)
+3. Shot (zone gate: ball.x ≥ shoot_min_ball_x_m AND dist_to_goal ≤ shoot_max_distance_m; lane_clear_score ≥ 0.45 enter / 0.25 hold, with was_shooting hysteresis; from dribble: require ≥ shoot_enter_from_dribble_score(0.65) with was_dribbling)
 4. Pass (best_pass_target — weighted: lane_clear*0.55 + forward_gain*0.30 + center_pull*0.15 - distance_penalty, min_score=0.60, min_forward=0.35)
 5. Dribble (target_x = ball.x+1.5, target_y = ball.y*0.65)
 
@@ -320,23 +335,30 @@ All from `tactics/targeting/predicates.py`, first argument is always `config`.
 
 ## Support Positioning (`tactics/targeting/support.py`)
 
-- Targets chaser (NOT the ball). Dynamic distance=1-2.8m, lateral 10°-45° triangle.
+- Targets chaser via `RoleAssignment.chaser_id` (down from `SupporterRole.target`). When chaser is an outfield player, use that specific teammate as reference. When `chaser_id == goalkeeper_id` (keeper elected as chaser in danger zone) → **danger zone fallback**.
+- Dynamic distance=`[support_min_distance_m(1.0), support_max_distance_m(2.2)]`, lateral 10°-45° triangle.
 - Behind direction: blend of goal direction + chaser direction (blend t = (bc_len-0.3)/0.5, transition 0.3-0.8m)
-- When <1m from target → push to 1m; when >2.8m → pull to 2.8m
-- Teammate spacing repulsion: if any teammate <0.9m, push away to min_spacing
-- No chaser → fallback to ball→own goal line 2.5m behind
+- When <min from target → push to min; when >max → pull to max; **in band + within `support_angle_hold_deadzone`(0.35rad) of ideal angle → hold current pose** (anti-orbit anchor, stops tangential sliding)
+- `SupporterRole._smooth_target` rate-limits the target at `support_target_smooth_speed`(2.5m/s); >1.5m jump snaps (chaser/role switch)
+- Spacing repulsion (two passes in `_spaced_support_target`): nearest teammate → `support_min_spacing_m`(0.9); nearest opponent → `support_opponent_avoid_radius_m`(0.6)
+- Danger zone fallback (`_danger_zone_support_target`): sorted outfield players split by index parity into **cover** (ball→own goal line at `support_danger_cover_depth_m` from goal, blocks shot channel) and **outlet** (upfield at `support_danger_outlet_forward_m`/±`support_danger_outlet_lateral_m`, receives keeper clear).
+- Reengage: when `sc_dist > support_reengage_distance_m(4.0)`, zero lateral offset (beeline approach to chaser at max_dist).
+- No chaser (neither assigned nor eligible) → fallback to ball→own goal line 2.5m behind
 
 ## Known Design Gaps & Evaluation
 
-See `.omo/docs/strategy-framework-analysis.md` (comprehensive architecture doc) and `.omo/docs/strategy-evaluation.md` (38 issues: 8🔴 21🟡 9🟢). Key 🔴 issues to be aware of:
+See `.omo/docs/strategy-framework-analysis.md` (comprehensive architecture doc) and `.omo/docs/strategy-evaluation.md` (42 issues: 4🔴 19🟡 13🟢 open, ✅6 resolved — 1.1/2.1/3.1/8.0/8.1/8.3 + Phase 1/2/3 log-driven fixes below). Key 🔴 issues to be aware of:
 
 1. ~~**Stale→None causes full-team stop**~~ **(RESOLVED 2026-07)** — ball and robot pose staleness now flow through LKG buffers: `BallLkgBuffer` (`soccer_framework/ball_lkg.py`, `ball_fresh_sec`+`ball_stale_grace_sec`=0.6s total) and `PoseLkgBuffer` (`soccer_framework/pose_lkg.py`, `robot_pose_fresh_sec`+`robot_pose_stale_grace_sec`=0.5s, per-team instances in `kit.pose_lkg_teammates`/`kit.pose_lkg_opponents`). `UpdateRecentBall`/`UpdateRobotPoses` delegate to these buffers; grace window does constant-velocity extrapolation (incl. theta, unwrapped) before clearing to None. Note: `game_state` stale→None is intentionally kept conservative (`_GAME_STATE_STALE_SEC=2.0`) to avoid playing through a referee STOP.
 2. **Reactive avoidance deadlocks in dense play** — no path-planning layer; multiple obstacles in a narrow gap cause oscillating via-points.
 3. **Chaser ignores opponent goalie** — `ball_claim_score` only considers distance+slot bias, does not account for opponent goalkeeper position when chasing near opponent goal.
-4. **Supporter ignores opponent robots** — `support_target` only spaces from teammates, not opponents.
+4. ~~**Supporter ignores opponent robots**~~ **(RESOLVED 2026-07)** — `_spaced_support_target` now applies a second push-out pass from the nearest opponent at `support_opponent_avoid_radius_m`(0.6m), via the shared `_push_out_from` helper. Also fixed the orbit-instability root cause: in-band + within `support_angle_hold_deadzone` the supporter holds its pose (`_chaser_relative_target`), and `SupporterRole._smooth_target` rate-limits the target (`support_target_smooth_speed`). Distance bounds de-hardcoded to `support_min/max_distance_m` (max 2.8→2.2). See `docs/strategy-evaluation.md` §8.0/8.1/8.3.
 5. **GK desperation clears into empty net** — approach_offset=0.2m, kick_theta=0.0 (straight toward opponent), no check if goalie is between ball and our goal.
 6. **Ball prediction history too short** — 10 frames at 30Hz = 0.33s, insufficient for goal-crossing prediction.
 7. **GK target speed limit defeated** — `gk_target_smooth_speed=2.0` but actual RUSH_OUT commands use `speed_multiplier=2.2`, and the speed limit only applies to the target smoothing, not the movement command.
+8. ~~**Keeper-as-chaser leaves no outfield chaser**~~ **(RESOLVED 2026-07)** — when ball is in danger zone and `select_chaser` returns the goalkeeper (KEEPER eligible in danger zone), `assign_roles`'s goalkeeper-first check left no player with ROLE_CHASER → both outfielders became SUPPORTER, mutual-referenced → drifted to sideline. Fix: `RoleAssignment` carries `chaser_id`/`goalkeeper_id`; `SupporterRole.target` uses real chaser_id; when `chaser_id == goalkeeper_id`, outfielders split into **cover** (ball→goal line) and **outlet** (upfield). See `docs/strategy-evaluation.md` §13 Phase 1.
+9. ~~**Chaser shoots from own half; shoot/dribble oscillation**~~ **(RESOLVED 2026-07)** — added zone gate (`shoot_min_ball_x_m`/`shoot_max_distance_m`) and `was_dribbling` hysteresis (`shoot_enter_from_dribble_score`). See §13 Phase 2.
+10. ~~**Supporter strafes backward; far-distance lateral orbit**~~ **(RESOLVED 2026-07)** — strafe alignment gate (`strafe_align_gate_rad`) scales translation when heading misalignment >1.2rad; far suppression uses beeline (`support_reengage_distance_m`). See §13 Phase 3.
 
 ## Where to Start for Common Changes
 

@@ -511,7 +511,7 @@ def create_play_subtree(
         name="NormalPlay",
         memory=False,
         children=[
-            AssignRoles(playbook),
+            AssignRoles(kit, playbook),
             _create_normal_roles_parallel(kit, playbook),
         ],
     )

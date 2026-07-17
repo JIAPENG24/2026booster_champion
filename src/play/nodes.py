@@ -56,8 +56,9 @@ class AssignRoles(py_trees.behaviour.Behaviour):
     this leaf runs in PLAYING.
     """
 
-    def __init__(self, playbook: Playbook):
+    def __init__(self, kit: "SoccerKit", playbook: Playbook):
         super().__init__("AssignRoles")
+        self._kit = kit
         self._playbook = playbook
         self.blackboard = BlackboardClient(name=self.name)
 
@@ -68,6 +69,11 @@ class AssignRoles(py_trees.behaviour.Behaviour):
             return py_trees.common.Status.SUCCESS
         assignment = self._playbook.assign_roles(context)
         self.blackboard.write(BlackboardKeys.ROLES, assignment)
+        # Cache on the kit so role strategies (e.g. SupporterRole) can read the
+        # assigned chaser/keeper IDs directly without re-deriving them by scanning
+        # teammates — which would otherwise pick another supporter as the chaser
+        # when the goalkeeper is the real chaser (danger-zone mutual drift).
+        self._kit.current_roles = assignment
         return py_trees.common.Status.SUCCESS
 
 

@@ -385,6 +385,18 @@ class MotionController:
                 vx *= scale
                 vy *= scale
 
+            # Alignment gate (P7): suppress translation when the body heading is
+            # far from target.theta so rotation catches up first. Without this the
+            # supporter/GK strafe sideways while facing away from the ball (logged
+            # facing_err up to ~3 rad). align_factor=1 when aligned, 0 when the
+            # heading error reaches the gate (→ near pure rotation).
+            gate = self._config.strategy.strafe_align_gate_rad
+            if gate > 0.0:
+                align_factor = max(0.0, 1.0 - abs(final_theta_error) / gate)
+                if align_factor < 1.0:
+                    vx *= align_factor
+                    vy *= align_factor
+
             # Heading correction toward target.theta
             vyaw = 0.0
             if abs(final_theta_error) > 1e-6:

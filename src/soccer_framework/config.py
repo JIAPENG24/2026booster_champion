@@ -145,6 +145,23 @@ class SoccerStrategyTuning:
         #  Chaser-lock recompute margin: keep old chaser if its score < best + margin.
         #  Reduced from the prior hardcoded 0.5 so a single penalty swing can break
         #  the lock when the old chaser becomes blocked.
+    chaser_lock_midfield_duration_s: float = 1.5
+        #  Lock duration (s) for the "otherwise" chaser lock tier (midfield + attack
+        #  half). Raised from the old hardcoded 0.5 to prevent rapid chaser ping-pong
+        #  in open play while still responsive enough for real superiority changes.
+
+    # Field-zone boundary ratios (decoupled from goalkeeper_challenge_area_x_ratio, issue 3.1).
+    # Previously three distinct decisions shared one ratio (or a coincidental hardcoded 0.20):
+    #   1. KEEPER challenge area          -> goalkeeper_challenge_area_x_ratio (kept)
+    #   2. chaser lock ladder defensive tier -> chaser_lock_defensive_x_ratio (new)
+    #   3. SIDE midfield/attack boundary     -> midfield_boundary_x_ratio (new, was hardcoded literal)
+    # Defaults preserve the prior -2.8m / +2.8m behavior; each can now be tuned independently.
+    chaser_lock_defensive_x_ratio: float = (
+        0.20  #  Defensive-zone boundary for chaser lock tier (field_length * ratio). Own-side, negative x.
+    )
+    midfield_boundary_x_ratio: float = (
+        0.20  #  Midfield/attack boundary for SIDE challenge decision (field_length * ratio). Attack-side, positive x.
+    )
 
     # Passing
     pass_enabled: bool = True  #  Master pass switch.
@@ -156,10 +173,36 @@ class SoccerStrategyTuning:
     dribble_advance_m: float = 1.5  #  Forward distance advanced by one dribble target.
     dribble_center_pull: float = 0.65  #  Pull toward centerline while dribbling to avoid hugging the sideline.
 
+    # Shooting gate (chaser shoot decision)
+    # Shooting is gated by ball position to avoid low-percentage long shots from the
+    # own half, plus symmetric shoot/dribble hysteresis so a single strong lane frame
+    # does not flip the chaser out of a dribble.
+    shoot_min_ball_x_m: float = 0.0  #  Minimum ball x (m) to allow shooting; 0.0 = attacking half (own goal at -7.0).
+    shoot_max_distance_m: float = 7.0  #  Maximum ball-to-opponent-goal distance (m) at which shooting is allowed.
+    shoot_enter_from_dribble_score: float = 0.65  #  lane_clear_score required to switch dribble -> shoot (higher than the fresh-entry 0.45).
+
     # Support positioning
-    support_depth_m: float = 1.05  #  Supporter depth behind the ball carrier.
-    support_lateral_m: float = 1.25  #  Lateral spacing for supporters.
+    # NOTE: support_depth_m / support_lateral_m are deprecated (unused); the live
+    # distance bounds are support_min/max_distance_m consumed in support.py.
+    support_depth_m: float = 1.05  #  [deprecated, unused] Supporter depth behind the ball carrier.
+    support_lateral_m: float = 1.25  #  [deprecated, unused] Lateral spacing for supporters.
     support_min_spacing_m: float = 0.9  #  Minimum teammate spacing to avoid clustering.
+    support_min_distance_m: float = 1.0  #  Min supporter-to-chaser distance (m); inside this the supporter backs off.
+    support_max_distance_m: float = 2.2  #  Max supporter-to-chaser distance (m); beyond this the supporter closes in (was 2.8).
+    support_angle_hold_deadzone: float = 0.35  #  Angular tolerance (rad, ~20 deg) within which an in-band supporter holds position to stop tangential orbiting.
+    support_opponent_avoid_radius_m: float = 0.6  #  Push supporter target away from the nearest opponent when closer than this (m).
+    support_target_smooth_speed: float = 2.5  #  Max rate (m/s) the smoothed supporter target may move toward the raw target; light damping to absorb frame-to-frame target jitter.
+    # Danger-zone support (when the goalkeeper is the assigned chaser and no
+    # outfielder has the chaser role): the two outfielders split by a stable index
+    # into a goal-line cover and an upfield outlet, both field-relative so they
+    # cannot drift by anchoring to each other.
+    support_danger_cover_depth_m: float = 1.2  #  Distance (m) the cover outfielder stands in front of own goal on the ball→goal line.
+    support_danger_outlet_forward_m: float = 4.0  #  Forward offset (m) of the outlet outfielder upfield of the ball.
+    support_danger_outlet_lateral_m: float = 2.0  #  Lateral offset (m) of the outlet outfielder from the ball.
+    support_reengage_distance_m: float = 4.0  #  Beyond this supporter-to-chaser distance (m), drop the lateral triangle offset and beeline straight behind the chaser to close the gap faster.
+
+    # Strafe motion
+    strafe_align_gate_rad: float = 1.2  #  Heading-error gate (rad) for strafe alignment; translation is fully suppressed at this error so the robot rotates to face the target first.
 
     # Goalkeeping and challenges
     goalkeeper_challenge_area_x_ratio: float = 0.20  #  X-axis ratio for defensive challenge area (field_length * ratio = area boundary).

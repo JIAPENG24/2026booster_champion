@@ -109,13 +109,15 @@
 
 ### ⚠️ 问题与建议
 
-#### 3.1 🔴 area_x 一参多用，耦合严重
+#### 3.1 ✅ area_x 一参多用，耦合严重（已实施）
+
 **问题**：`goalkeeper_challenge_area_x_ratio=0.20` 推出的 `area_x=-2.8m` 同时用于：
 1. KEEPER 是否参与争球（`ball_in_own_defensive_area`）
 2. chaser 锁定时间阶梯（`ball.x < area_x` → 锁 2.0s）
 3. SIDE 挑战判定（`ball_is_in_midfield_or_own_half` 用 `field_length*0.20=+2.8`，数值巧合相同但语义不同）
 
 这三个决策的关注点完全不同（守门员出击范围 vs chaser 稳定性 vs SIDE 参与度），共用一个比例参数会导致调一个动三个。
+（注：第 3 点实际情况比描述更严重——`predicates.ball_is_in_midfield_or_own_half` 原本用的是**硬编码字面量 `0.20`**，根本不读任何 config 字段；且方向相反（+2.8 vs -2.8），数值相同纯属巧合。）
 
 **建议**：
 - **参数**：拆分为独立参数：
@@ -123,6 +125,17 @@
   - `chaser_lock_defensive_x_threshold_m`（chaser 锁定阶梯边界，可独立调）
   - `midfield_boundary_x_ratio`（中场/进攻分界，当前隐式 0.20，建议显式化）
 - **预期收益**：各区域策略可独立调优，不互相干扰。
+
+**实施状态（2026-07）**：
+- ✅ **参数拆分**：`src/soccer_framework/config.py:SoccerStrategyTuning` 新增两个独立 ratio 字段（均默认 0.20，行为零变化）：
+  - `chaser_lock_defensive_x_ratio=0.20` — chaser 锁定阶梯防守档边界（own-side，-2.8m）。
+  - `midfield_boundary_x_ratio=0.20` — SIDE 中场/进攻挑战分界（attack-side，+2.8m）。
+  > 单位选择：经评估采用 `_ratio`（比例）而非 issue 建议的 `_m`（米），理由：与既有 `goalkeeper_challenge_area_x_ratio` 风格一致，且随场地尺寸自动缩放（场地尺寸可变）。默认 0.20 → -2.8m / +2.8m 完全保留原行为。
+- ✅ **SIDE 挑战解耦**：`src/tactics/targeting/predicates.py:ball_is_in_midfield_or_own_half` 由硬编码 `field_length*0.20` 改读 `config.strategy.midfield_boundary_x_ratio`，消除魔法数字。
+- ✅ **chaser 锁定解耦 + 消除重复**：`src/play/playbook.py:DefaultPlaybook` 新增 `_chaser_lock_defensive_x()` / `_chaser_lock_duration(ball)` 两个 helper，集中三档阶梯逻辑（3.0s/2.0s/0.5s），读取新参数（不再借用 GK 参数）。`select_chaser` 中原本**重复两遍**的阶梯计算（旧 line 242-249 / 274-281）+ 防守区锁定刷新判断全部替换为调用 helper，DRY 违规一并消除。
+- ✅ **文档同步**：`AGENTS.md` 谓词表与 Key Parameters 段已标注三个 ratio 的独立语义。
+- **架构合规**：AR-04（`play/` 不导入 py_trees）保留——仅通过 `self.kit.config` 读字段；改动是"加字段 + 改读源"，无新依赖；AR-02/08 无影响。
+- **后续**：issue 3.2（中场/进攻边界改非对称、调小到 0.10）现可仅改 `midfield_boundary_x_ratio` 默认值一行落地，不再牵动 KEEPER/chaser lock。`ready_stance.py:59` 的 `field_length*0.20`（对手开球 READY 站位）属独立语义，不在本次范围。
 
 #### 3.2 🟡 中场/进攻边界对称划分不合理
 **问题**：`ball_is_in_midfield_or_own_half` 用 `ball.x < field_length*0.20=+2.8`，意味着球在 `ball.x < +2.8`（从己方球门 -7 到对方半场 2.8m 处，共 9.8m，占全场 70%）时 SIDE **总是**挑战。即使在对方半场前段（`ball.x=+2.5`，深入对方半场 36%）SIDE 仍然无条件前压，可能导致 SIDE 过度前压、后方空虚。注：`+2.8` 边界相对进攻半场（0~+7）深度占 40%，相对全场（14m）占 20%。
@@ -344,22 +357,31 @@
 ## 8. 接应站位评价
 
 ### ✅ 优点
-- `support_target` 追踪 chaser 而非球，这是正确的设计——接应手应站在 chaser 的接应位而非球的位置。
-- 动态距离（1-2.8m）+ 三角角（10-45°）+ side 按 player_id 奇偶交替，保证两个接应手不重叠。
-- `_spaced_support_target` 队友推开机制避免接应手挤在一起。
+- `support_target` 追踪 chaser（通过 `RoleAssignment.chaser_id`，下传真实已分配 chaser），而非最近非 GK 队友扫描（旧方案在 keeper 当选 chaser 时两 supporter 互为参照）。
+- 动态距离（1-2.2m）+ 三角角（10-45°）+ side 按 player_id 奇偶交替，保证两个接应手不重叠。
+- `_spaced_support_target` 两趟推开（队友 + 对手）机制避免接应手挤在一起或站在对手身旁。
+- **稳定性锚定**：带内 + 角度容差内返回当前位姿（hold），消除切向轨道抖动；叠加速率限制平滑吸收帧间跳变。
+- **危险区 fallback**：守门员为真实 chaser 时（球在本方危险区），外场分 cover（球门线前护门）和 outlet（前场接解围），互不参照。
+- **远距重接应**：sc_dist > 4.0m 时弃三角侧偏为直线逼近，消除横向绕行。
+- **strafe 朝向优先**：heading 误差 > 1.2rad 时缩平移至纯旋转，消除 strafe 背对球。
 
 ### ⚠️ 问题与建议
 
-#### 8.1 🔴 接应位置不规避对手
-**问题**：`_spaced_support_target` 只推开队友（`support_min_spacing_m=0.9`），不推离对手。接应手可能站在对手身旁，接到球立即被抢。
+#### 8.0 ✅ 接应轨道抖动（稳定性根因，已实施 2026-07）
+**问题（仿真观察）**：`_chaser_relative_target` 每帧用"当前 sc_dist + 公式角度"重算目标。带内时 `desired_dist = sc_dist`，目标落在"同半径、公式角度"上；球/chaser 移动 + 球位置噪声使公式角度持续漂移 → supporter 永远沿圆弧切向追一个滑移目标，触发不了 `arrive`（0.15m）→ 持续绕 chaser 侧滑（strafe 模式下面向球横挪），表现为不合理的来回移动。这与原 docstring"带内应基本站定"完全不符。
 
-**建议**：
-- **策略**：在 `_spaced_support_target` 中加入对手推开——最近对手距离<阈值时，沿 opponent→target 方向推出：
-  ```
-  if min_opponent_dist < opponent_avoid_radius:
-      target += normalize(target - opponent_pos) * push_distance
-  ```
-- 接应位选择应同时考虑"接球通道净空"（chaser→接应位的传球路线是否被对手阻挡）。
+**实施**：
+- **死区锚定**（`tactics/targeting/support.py:_chaser_relative_target`）：算完理想目标后，若 `sc_dist ∈ [support_min_distance_m, support_max_distance_m]` 且 `|normalize_angle(sc_angle − ideal_angle)| ≤ support_angle_hold_deadzone(0.35rad≈20°)` → 直接返回 `own_pose`（hold，仅由 motion 的 active-hold 面向球）。跨带/跨角才全量重定位。
+- **速率限制平滑**（`play/default_roles.py:SupporterRole._smooth_target`）：仿 GK `gk_target_smooth_speed`，smoothed 目标以 `support_target_smooth_speed(2.5m/s)` 速率追 raw；`|Δ|>1.5m`（chaser/角色切换）snap。
+- 新增配置：`support_angle_hold_deadzone`、`support_target_smooth_speed`。
+
+#### 8.1 ✅ 接应位置不规避对手（已实施 2026-07）
+**原问题**：`_spaced_support_target` 只推开队友（`support_min_spacing_m=0.9`），不推离对手。接应手可能站在对手身旁，接到球立即被抢。
+
+**实施**（`tactics/targeting/support.py`）：
+- `_spaced_support_target` 改为两趟顺序推开：① 最近队友→`support_min_spacing_m`；② **最近对手→`support_opponent_avoid_radius_m(0.6m)`**。
+- 抽出 `_push_out_from(field, ball, target, obstacle, radius, player_id)` 复用，末尾统一 `clamp_inside_field` + `face_ball_theta`。
+- 新增配置：`support_opponent_avoid_radius_m`。读 `context.opponents`（与 motion.py 一致）。
 - **预期收益**：接应手接到球后有处理空间，减少接球即丢。
 
 #### 8.2 🟡 三角角不随对手压迫调整
@@ -371,12 +393,13 @@
   - chaser 空旷 → 角度减小到 10-20°（靠近支援）
 - **预期收益**：接应站位更贴合比赛节奏。
 
-#### 8.3 🟡 接应距离上限 2.8m 对 3v3 可能偏大
-**问题**：3v3 场地 14×9m，每队仅 3 人。接应手距 chaser 2.8m 意味着两人间距占场地宽度的 31%，传球距离长→传球精度下降→易被拦截。
+#### 8.3 ✅ 接应距离上限 2.8m 对 3v3 偏大（已实施 2026-07）
+**原问题**：3v3 场地 14×9m，每队仅 3 人。接应手距 chaser 2.8m 意味着两人间距占场地宽度的 31%，传球距离长→传球精度下降→易被拦截。
 
-**建议**：
-- **参数**：接应距离上限降到 2.0~2.3m（`support_max_distance`），缩短传球距离。
-- 但需平衡——太近则接应手和 chaser 挤在一起失去拉开效果。建议动态：对手密集时拉近（1.5m），空旷时拉远（2.5m）。
+**实施**（`tactics/targeting/support.py` + `soccer_framework/config.py`）：
+- 距离界 `1.0 / 2.8` 硬编码改为配置 `support_min_distance_m(1.0)` / `support_max_distance_m(2.2)`。
+- 上限 2.8 → **2.2**（约占场地宽 24%，兼顾拉开与传球精度）。
+- 原死字段 `support_depth_m` / `support_lateral_m` 标记 `[deprecated, unused]`（保留以免破坏外部 playbook）。
 - **预期收益**：传球更精准，接应更紧密。
 
 #### 8.4 🟢 chaser 相对方向 blend 过渡区间窄
@@ -533,9 +556,10 @@
 | 🟡 | 4.2 | 队友层双层避障冗余（已降级，原 🔴"方向矛盾"经核查不成立） | 策略（去重邻居） | 运动更平稳 |
 | 🔴 | 6.1 | chaser 选举忽略对手 | 策略（加对手干扰项） | 减少 chaser 被截 |
 | 🔴 | 8.1 | 接应位不规避对手 | 策略（加对手推开） | 接球后不丢球 |
+| ✅ | 8.0/8.1/8.3 | 接应轨道抖动+对手规避+距离收紧（已实施） | 策略+参数 | 消除侧滑抖动；接球有空间；传球更精准 |
 | 🔴 | 9.1 | desperation 阈值致空门 | 参数(降到1.0~1.2) | 减少空门失球 |
 | 🔴 | 10.1 | 球预测历史太短 | 参数(15~20帧) | 预测更准 |
-| 🟡 | 3.1 | area_x 一参多用耦合 | 参数（拆分） | 独立调优 |
+| ✅ | 3.1 | area_x 一参多用耦合（已实施） | 参数（拆分） | 独立调优 |
 | 🟡 | 3.2 | 中场/进攻边界过宽 | 参数+策略 | SIDE 站位合理 |
 | 🟡 | 4.3 | 近距离减速不平滑 | 参数（速度曲线） | 减少启停 |
 | 🟡 | 4.4 | 角速度死区抖动 | 参数（线性过渡） | 消除振荡 |
@@ -547,7 +571,7 @@
 | 🟡 | 7.2 | 传球不考虑接球者射门 | 策略（加潜力分） | 传球更有价值 |
 | 🟡 | 7.3 | 盘带撞向对手 | 策略（避对手方向） | 盘带更安全 |
 | 🟡 | 8.2 | 三角角不随压迫调整 | 策略（动态角度） | 接应更灵活 |
-| 🟡 | 8.3 | 接应距离偏大 | 参数(降到2.0~2.3) | 传球更精准 |
+| ✅ | 8.3 | 接应距离偏大 | 参数(降到2.0~2.3) | 传球更精准 |
 | 🟡 | 9.2 | 守门员限速形同虚设 | 参数（确认/调整） | 反应更及时 |
 | 🟡 | 9.3 | RUSH_OUT 让球逻辑 | 策略（严格条件） | 避免错误让球 |
 | 🟡 | 9.4 | GUARD 强制条件过简 | 策略（加球门区判定） | 出击更精准 |
@@ -568,6 +592,57 @@
 | 🟢 | 9.5 | 弧形站位参数固定 | 策略（动态半径） | 站位优化 |
 | 🟢 | 10.4 | rest_distance 上限过大 | 参数(降到16m) | 避免异常值 |
 | 🟢 | 11.3 | 障碍无优先级 | 策略（差异化） | 避让更合理 |
+| ✅ | 新 | 守门员当 chaser 外场互漂+危险区站法（已实施 2026-07） | 策略 | 消除外场漂移出比赛区域 |
+| ✅ | 新 | chaser 射门区域门槛+was_dribbling 迟滞（已实施 2026-07） | 策略+参数 | 减少本方半场远射+决策抖动 |
+| ✅ | 新 | strafe 朝向优先+远距直线追赶（已实施 2026-07） | 策略+参数 | supporter 面向球更快到位 |
+
+---
+
+## 13. 已实施优化汇总（Phase 1+2+3，2026-07 日志驱动）
+
+针对仿真日志 `Agent Runtime.log`（16:11:15–16:22:33，score 3:1）中发现的 **7 大问题** 的三阶段修复。
+
+### Phase 1 — 守门员当 chaser 时外场互漂消除（P1/P2/P3）
+
+**架构缺陷**：球在本方危险区时 `select_chaser` 可能返回守门员（KEEPER 在危险区 eligible），但 `assign_roles` 先匹配 GK 再匹配 chaser → 守门员获 GK 角色、无球员获 CHASER、外场全变 SUPPORTER。support_target 的 chaser 扫描排除了 GK → 两 supporter 互为 chaser 参照 → 三角几何+pushout+clamp 漂移出比赛区域。日志 16:16:32–16:17:06（34 秒）球卡在球门时，p1 沿 y=-4.25（边线）从前场角旗漂移向中场。
+
+**实施文件**：`play/playbook.py`(RoleAssignment 增字段/assign_roles 填充)、`runtime.py`(SoccerKit.current_roles 槽)、`play/nodes.py`(AssignRoles 写 kit)、`play/default_roles.py`(SupporterRole.target 分派)、`tactics/targeting/support.py`(+chaser_id/危险区 fallback)、`targeting/__init__.py`(透传)
+
+**关键设计**：
+- `RoleAssignment` 增 `chaser_id`/`goalkeeper_id` 字段；`SoccerKit.current_roles(Any)` 避免 runtime→play 反向依赖
+- `support_target` 接真实 `chaser_id`；当 `chaser_id == goalkeeper_id`（无外场 chaser）→ 调用 `_danger_zone_support_target`
+- 危险区站法：sorted 外场列表按 index 奇偶分 **cover**（球→球门线 × `cover_depth` 封射门）和 **outlet**（前场 `outlet_forward`/`outlet_lateral` 接解围）
+- 通用于任意 `keeper_id`（1/2/3）
+- 新配置：`support_danger_cover_depth_m=1.2`、`support_danger_outlet_forward_m=4.0`、`support_danger_outlet_lateral_m=2.0`
+
+**验证**：cover(-7.037,1.199) ✓；outlet(-3.030,2.960) ✓；gk=2 时 p1(cover)/p3(outlet) ✓。
+
+### Phase 2 — chaser 决策门槛（P5/P6）
+
+**P6 本方半场远射**：日志多处显示 ball.x=-6.5~-3.5 时 shoot at (7,0)（13m+），低命中率长传。
+**P5 shoot/dribble 快速抖动**：16:16:00.093–.362 之间 shoot↔dribble 翻转 2 次。
+
+**实施文件**：`tactics/targeting/attack.py`(select_kick_target 加区域门/shot_lane_is_clear 加 was_dribbling)、`play/default_roles.py`(ChaserRole 透传)、`targeting/__init__.py`(透传)
+
+**关键设计**：
+- `_shot_zone_allowed`：`ball.x ≥ shoot_min_ball_x_m AND dist(ball, opp_goal) ≤ shoot_max_distance_m`
+- `shot_lane_is_clear` 增加 `was_dribbling` 参数 → 从 dribble 切 shoot 需 `shoot_enter_from_dribble_score(0.65)`（idle→shoot: 0.45、shoot→hold: 0.25）
+- 新配置：`shoot_min_ball_x_m=0.0`、`shoot_max_distance_m=7.0`、`shoot_enter_from_dribble_score=0.65`
+
+### Phase 3 — 机动质量（P4/P7）
+
+**P7 strafe 背对球**：日志显示 supporter facing_err 高达 2–3 rad（114°–172°）。strafe 模式下无对齐门 → 严重失配时边平移边慢转。
+**P4 supporter 被遗留在后**：16:15:40–46 球在前场 (5.19,-1.8) 时 p1 仍在 (-5.67,-1.40)、sc_dist≈7.5–8.6。远距时三角侧偏使 supporter 横向跑弧形而非直接追赶。
+
+**实施文件**：`tactics/motion.py`(strafe 块加 align_factor)、`tactics/targeting/support.py`(远距重接应对)
+
+**关键设计**：
+- strafe `align_factor = max(0, 1 − |final_theta_error| / strafe_align_gate_rad)` 缩放 vx/vy；1.2 rad→0（纯旋转），0 rad→1.0（全速）
+- 远距 `sc_dist > support_reengage_distance_m` 时三角侧偏角置 0（直线逼近 chaser 至 max_dist 内再走三角）
+- 新配置：`strafe_align_gate_rad=1.2`、`support_reengage_distance_m=4.0`
+
+### 全部改动文件（14 个）
+`playbook.py` `runtime.py` `nodes.py` `play_subtree.py` `default_roles.py` `support.py` `targeting/__init__.py` `attack.py` `motion.py` `config.py` + 文档 2 个 + 临时冒烟脚本（已清理）。`python -m compileall src` exit 0。数值冒烟 28 项全 PASS。
 
 ---
 
@@ -575,11 +650,17 @@
 
 若要系统性优化，建议按以下顺序推进（每步可独立验证）：
 
+### 第 0 波（日志驱动稳定性，✅ 已实施 2026-07）
+1. **守门员当 chaser 外场互漂**（Phase 1）— 支持者按真实角色锚定，危险区分 cover/outlet，消除漂移
+2. **接应位规避对手**（8.1，Phase 1 含）— 提升接球后控球率
+3. **挤位轨道锚定**（8.0/8.3，前序实施）— 死区+速率限制消除 side oscillation
+4. **射门区域门槛+盘带迟滞**（Phase 2）— 减少本方半场无意义远射+决策翻转
+5. **strafe 朝向优先+远距直线追赶**（Phase 3）— supporter 面向球更快到位
+
 ### 第一波（稳定性，🔴 优先）
 1. **stale grace 窗口**（1.1/2.1）— 消除非受迫丢球，最直接影响比赛稳定性
 2. **chaser 加对手干扰**（6.1）— 提升抢球成功率
-3. **接应位规避对手**（8.1）— 提升接球后控球率
-4. **desperation 阈值收紧**（9.1）— 减少空门
+3. **desperation 阈值收紧**（9.1）— 减少空门
 
 ### 第二波（运动质量，🔴+🟡）
 5. **队友避让去重**（4.2，已降级 🟡）— 减少冗余过冲

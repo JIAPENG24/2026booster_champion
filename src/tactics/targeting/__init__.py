@@ -139,11 +139,14 @@ class Targeting:
         is_player_allowed: PlayerAllowed,
         *,
         was_shooting: bool = False,
+        was_dribbling: bool = False,
+        lane_ema: float | None = None,
     ) -> tuple[Pose2D, str]:
         return attack.select_kick_target(
             self.config, self.field, self.obstacles,
             player_id, context, is_player_allowed,
-            was_shooting=was_shooting,
+            was_shooting=was_shooting, was_dribbling=was_dribbling,
+            lane_ema=lane_ema,
         )
 
     def select_clear_or_pass_target(
@@ -205,6 +208,9 @@ class Targeting:
     def dribble_target(self, ball: BallState) -> Pose2D:
         return attack.dribble_target(self.config, self.field, ball)
 
+    def shot_zone_allowed(self, ball: BallState) -> bool:
+        return attack._shot_zone_allowed(self.config, self.field, ball)
+
     def kick_reason(
         self,
         target: Pose2D,
@@ -219,10 +225,12 @@ class Targeting:
         player_id: int,
         context: PlayContext,
         is_player_allowed: PlayerAllowed,
+        chaser_id: int | None = None,
+        danger_zone: bool = False,
     ) -> tuple[Pose2D, bool]:
         return support.support_target(
             self.config, self.field, player_id, context,
-            is_player_allowed,
+            is_player_allowed, chaser_id=chaser_id, danger_zone=danger_zone,
         )
 
     # Restart avoidance

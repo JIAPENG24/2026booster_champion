@@ -114,6 +114,11 @@ class SoccerKit:
         self.ball_lkg = BallLkgBuffer(config)
         self.pose_lkg_teammates = PoseLkgBuffer(config)
         self.pose_lkg_opponents = PoseLkgBuffer(config)
+        # Latest dynamic role assignment (RoleAssignment | None). Typed Any to avoid a
+        # runtime -> play reverse dependency (RoleAssignment lives in play.playbook); the
+        # PLAY layer writes it via AssignRoles and reads it back to anchor supporters to
+        # the assigned chaser rather than re-deriving it by scanning teammates.
+        self.current_roles: Any = None
         self._robot_services: RobotServices | None = None
 
     # Service binding

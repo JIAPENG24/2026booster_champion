@@ -126,6 +126,16 @@ class UpdateRecentBall(_DataLeaf):
     def __init__(self, kit: "SoccerKit"):
         super().__init__("UpdateRecentBall")
         self._kit = kit
+        self._last_staleness_log_at: float = 0.0
+
+    def _staleness_state(self, age: float) -> str:
+        fresh = self._kit.config.strategy.ball_fresh_sec
+        grace = self._kit.config.strategy.ball_stale_grace_sec
+        if age <= fresh:
+            return "fresh"
+        if age <= fresh + grace:
+            return "grace"
+        return "stale"
 
     def update(self) -> py_trees.common.Status:
         context = self.blackboard.read(BlackboardKeys.PLAY_CONTEXT)
@@ -133,6 +143,37 @@ class UpdateRecentBall(_DataLeaf):
         if not isinstance(context, PlayContext) or now is None:
             return py_trees.common.Status.SUCCESS
         context.ball = self._kit.ball_lkg.update(context.ball, now)
+        # Periodic ball staleness summary (0.5 Hz) for LKG fix verification.
+        if now - self._last_staleness_log_at >= 2.0:
+            self._last_staleness_log_at = now
+            logger = self._kit.logger
+            if logger is not None:
+                ball = context.ball
+                if ball is not None:
+                    age = now - ball.last_seen_at
+                    state = self._staleness_state(age)
+                    confidence = ball.confidence if hasattr(ball, "confidence") else 1.0
+                else:
+                    state = "stale"
+                    age = -1.0
+                    confidence = 0.0
+                if ball is not None:
+                    msg = (
+                        f"ball staleness state={state} "
+                        f"age={age:.3f}s conf={confidence:.2f} "
+                        f"pos=({ball.x:.3f},{ball.y:.3f})"
+                    )
+                else:
+                    msg = "ball staleness state=stale no data"
+                logger.info(
+                    msg,
+                    event="ball_staleness",
+                    state=state,
+                    age_sec=round(age, 3),
+                    confidence=round(confidence, 2),
+                    ball_x=round(ball.x, 3) if ball is not None else None,
+                    ball_y=round(ball.y, 3) if ball is not None else None,
+                )
         return py_trees.common.Status.SUCCESS
 
 
@@ -155,6 +196,26 @@ class UpdateRobotPoses(_DataLeaf):
     def __init__(self, kit: "SoccerKit"):
         super().__init__("UpdateRobotPoses")
         self._kit = kit
+        self._last_staleness_log_at: float = 0.0
+
+    @staticmethod
+    def _count_staleness(
+        robots: dict, now: float, fresh_sec: float, grace_sec: float,
+    ) -> dict[str, int]:
+        counts = {"fresh": 0, "grace": 0, "stale": 0}
+        for robot in robots.values():
+            pose = robot.pose
+            if pose is None:
+                counts["stale"] += 1
+                continue
+            age = now - robot.last_seen_at
+            if age <= fresh_sec:
+                counts["fresh"] += 1
+            elif age <= fresh_sec + grace_sec:
+                counts["grace"] += 1
+            else:
+                counts["stale"] += 1
+        return counts
 
     def update(self) -> py_trees.common.Status:
         context = self.blackboard.read(BlackboardKeys.PLAY_CONTEXT)
@@ -163,6 +224,27 @@ class UpdateRobotPoses(_DataLeaf):
             return py_trees.common.Status.SUCCESS
         self._kit.pose_lkg_teammates.update(context.teammates, now)
         self._kit.pose_lkg_opponents.update(context.opponents, now)
+        # Periodic pose staleness summary (0.5 Hz) for LKG fix verification.
+        if now - self._last_staleness_log_at >= 2.0:
+            self._last_staleness_log_at = now
+            logger = self._kit.logger
+            if logger is not None:
+                strat = self._kit.config.strategy
+                tm = self._count_staleness(
+                    context.teammates, now,
+                    strat.robot_pose_fresh_sec, strat.robot_pose_stale_grace_sec,
+                )
+                opp = self._count_staleness(
+                    context.opponents, now,
+                    strat.robot_pose_fresh_sec, strat.robot_pose_stale_grace_sec,
+                )
+                logger.info(
+                    f"pose staleness teammates_f={tm['fresh']} g={tm['grace']} s={tm['stale']} "
+                    f"opponents_f={opp['fresh']} g={opp['grace']} s={opp['stale']}",
+                    event="pose_staleness",
+                    teammates=tm,
+                    opponents=opp,
+                )
         return py_trees.common.Status.SUCCESS
 
 

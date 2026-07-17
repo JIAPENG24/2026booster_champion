@@ -37,8 +37,12 @@ class ChaserRole(RoleStrategy):
 
     name = "chaser"
 
+    _STATUS_LOG_INTERVAL_SEC = 2.0  # 0.5 Hz periodic status
+
     def __init__(self) -> None:
         self._last_decision: str | None = None
+        self._last_status_log_at: float = 0.0
+        self._lane_ema: float = 1.0  # EMA-smoothed lane score (1.0 = fully clear).
 
     def target(
         self,
@@ -49,10 +53,59 @@ class ChaserRole(RoleStrategy):
         ball = context.known_ball
         kt = self.kick_target(kit, player_id, context)
         kick_theta = math.atan2(kt.y - ball.y, kt.x - ball.x)
-        return kit.motion.approach_target(
+        approach = kit.motion.approach_target(
             ball,
             kick_theta,
             _CHASER_APPROACH_OFFSET,
+        )
+        self._log_status(kit, player_id, context, approach, kt)
+        return approach
+
+    def _log_status(
+        self,
+        kit: "SoccerKit",
+        player_id: int,
+        context: PlayContext,
+        approach_target: Pose2D,
+        kick_target: Pose2D,
+    ) -> None:
+        """Periodic (0.5 Hz) chaser status log for strategy evaluation."""
+        logger = kit.logger
+        if logger is None:
+            return
+        robot = context.teammates.get(player_id)
+        if robot is None or robot.pose is None:
+            return
+        now = time.monotonic()
+        if now - self._last_status_log_at < self._STATUS_LOG_INTERVAL_SEC:
+            return
+        self._last_status_log_at = now
+        ball = context.known_ball
+        pose = robot.pose
+        shot_zone = kit.targeting.shot_zone_allowed(ball)
+        lane_score = kit.targeting.shot_lane_score(context)
+        was_dribbling = self._last_decision == "dribble"
+        logger.info(
+            f"chaser status player={player_id} decision={self._last_decision} "
+            f"pose=({pose.x:.2f},{pose.y:.2f}) "
+            f"target=({approach_target.x:.2f},{approach_target.y:.2f}) "
+            f"kick_target=({kick_target.x:.2f},{kick_target.y:.2f}) "
+            f"ball=({ball.x:.2f},{ball.y:.2f}) "
+            f"shot_zone={shot_zone} lane={lane_score:.2f} dribbling={was_dribbling}",
+            event="chaser_status",
+            player_id=player_id,
+            decision=self._last_decision,
+            pose_x=round(pose.x, 2),
+            pose_y=round(pose.y, 2),
+            target_x=round(approach_target.x, 2),
+            target_y=round(approach_target.y, 2),
+            kick_target_x=round(kick_target.x, 2),
+            kick_target_y=round(kick_target.y, 2),
+            ball_x=round(ball.x, 2),
+            ball_y=round(ball.y, 2),
+            shot_zone_allowed=shot_zone,
+            lane_score=round(lane_score, 2),
+            was_dribbling=was_dribbling,
         )
 
     def kick_target(
@@ -61,12 +114,18 @@ class ChaserRole(RoleStrategy):
         player_id: int,
         context: PlayContext,
     ) -> Pose2D:
+        # EMA smoothing: blend raw lane score to suppress per-frame obstacle jitter.
+        raw_lane = kit.targeting.shot_lane_score(context)
+        self._lane_ema = 0.3 * raw_lane + 0.7 * self._lane_ema
+
         slot = kit.config.ready_slot_for_player(player_id)
         target, decision = kit.targeting.select_kick_target(
             player_id,
             context,
             kit.is_player_allowed,
             was_shooting=self._last_decision == "shoot",
+            was_dribbling=self._last_decision == "dribble",
+            lane_ema=self._lane_ema,
         )
 
         if decision != self._last_decision:
@@ -181,6 +240,7 @@ class SupporterRole(RoleStrategy):
 
     _PUSHOUT_LOG_INTERVAL_SEC = 2.0
     _STATUS_LOG_INTERVAL_SEC = 2.0  # 0.5 Hz periodic status
+    _SMOOTH_SNAP_DISTANCE_M = 1.5  # Beyond this, snap instead of smoothing (chaser/role switch).
 
     def __init__(self) -> None:
         self._was_pushed: bool = False
@@ -190,6 +250,11 @@ class SupporterRole(RoleStrategy):
         self._last_status_log_at: float = 0.0
         self._last_mode: str | None = None
         self._was_willing_to_kick: bool = False
+        # Anti-jitter target smoothing (rate-limited toward the raw support target).
+        self._smoothed_target: Pose2D | None = None
+        self._last_smooth_t: float | None = None
+        # Danger-zone state tracking for event logging.
+        self._danger_zone_active: bool = False
 
     def target(
         self,
@@ -197,11 +262,56 @@ class SupporterRole(RoleStrategy):
         player_id: int,
         context: PlayContext,
     ) -> Pose2D:
-        target, was_pushed = kit.targeting.support_target(
+        # Anchor to the ASSIGNED chaser (read from the cached RoleAssignment)
+        # rather than letting support_target re-derive it by scanning teammates.
+        # When the goalkeeper is the assigned chaser (ball in the defensive area
+        # and keeper closest — chaser_id == goalkeeper_id), no outfield player has
+        # the chaser role; the supporter switches to fixed-field-reference
+        # danger-zone positioning so the two outfielders no longer anchor to each
+        # other and drift to the corner flag.
+        chaser_id: int | None = None
+        danger_zone = False
+        roles = kit.current_roles
+        if roles is not None:
+            cid = roles.chaser_id
+            gkid = roles.goalkeeper_id
+            if cid is not None and gkid is not None and cid == gkid:
+                danger_zone = True
+            elif cid is not None:
+                chaser_id = cid
+
+        if danger_zone != self._danger_zone_active:
+            self._danger_zone_active = danger_zone
+            logger = kit.logger
+            if logger is not None:
+                gk_id = kit.config.goalkeeper_player_id()
+                outfield_ids = sorted(kit.config.player_ids)
+                if gk_id in outfield_ids:
+                    outfield_ids.remove(gk_id)
+                try:
+                    idx = outfield_ids.index(player_id)
+                except ValueError:
+                    idx = player_id
+                dz_role = "cover" if idx % 2 == 0 else "outlet"
+                logger.info(
+                    f"supporter danger_zone={danger_zone} player={player_id} role={dz_role} "
+                    f"ball=({context.known_ball.x:.3f},{context.known_ball.y:.3f})",
+                    event="supporter_danger_zone",
+                    player_id=player_id,
+                    active=danger_zone,
+                    role=dz_role,
+                    ball_x=round(context.known_ball.x, 3),
+                    ball_y=round(context.known_ball.y, 3),
+                )
+
+        raw, was_pushed = kit.targeting.support_target(
             player_id,
             context,
             kit.is_player_allowed,
+            chaser_id=chaser_id,
+            danger_zone=danger_zone,
         )
+        target = self._smooth_target(kit, raw)
 
         if was_pushed != self._was_pushed:
             self._was_pushed = was_pushed
@@ -227,6 +337,46 @@ class SupporterRole(RoleStrategy):
 
         self._log_status(kit, player_id, context, target)
         return target
+
+    def _smooth_target(self, kit: "SoccerKit", raw: Pose2D) -> Pose2D:
+        """Rate-limit the supporter target toward ``raw`` to absorb frame jitter.
+
+        Mirrors the GK ``gk_target_smooth_speed`` pattern: the smoothed position
+        chases ``raw`` at most ``support_target_smooth_speed`` m/s. A large jump
+        (> snap distance) snaps immediately so chaser/role switches are not
+        artificially lagged. ``theta`` is taken straight from ``raw`` (heading
+        tracks the ball without smoothing).
+        """
+
+        smooth_speed = kit.config.strategy.support_target_smooth_speed
+        now = time.monotonic()
+        prev = self._smoothed_target
+        if prev is None or smooth_speed <= 0.0:
+            self._smoothed_target = Pose2D(raw.x, raw.y, raw.theta)
+            self._last_smooth_t = now
+            return self._smoothed_target
+
+        dt = 0.0
+        if self._last_smooth_t is not None:
+            dt = max(0.0, now - self._last_smooth_t)
+        if dt <= 0.0:
+            # Same clock tick: hold smoothed position, adopt raw heading.
+            self._smoothed_target = Pose2D(prev.x, prev.y, raw.theta)
+            return self._smoothed_target
+
+        dx = raw.x - prev.x
+        dy = raw.y - prev.y
+        dist = math.hypot(dx, dy)
+        if dist > self._SMOOTH_SNAP_DISTANCE_M:
+            nx, ny = raw.x, raw.y
+        else:
+            step = min(dist, smooth_speed * dt)
+            nx = prev.x + dx * (step / dist) if dist > 1e-6 else prev.x
+            ny = prev.y + dy * (step / dist) if dist > 1e-6 else prev.y
+
+        self._smoothed_target = Pose2D(nx, ny, raw.theta)
+        self._last_smooth_t = now
+        return self._smoothed_target
 
     def _log_status(
         self,
@@ -323,16 +473,35 @@ class SupporterRole(RoleStrategy):
             return
         self._last_status_log_at = now
 
+        chaser_pose_str = (
+            f"chaser_pose=({chaser_pose.x:.2f},{chaser_pose.y:.2f}) "
+            if chaser_pose is not None
+            else ""
+        )
+        dz_role: str | None = None
+        if self._danger_zone_active:
+            outfield_ids = sorted(kit.config.player_ids)
+            if gk_id in outfield_ids:
+                outfield_ids.remove(gk_id)
+            try:
+                idx = outfield_ids.index(player_id)
+                dz_role = "cover" if idx % 2 == 0 else "outlet"
+            except ValueError:
+                pass
         logger.info(
             f"supporter status player={player_id} mode={mode} "
+            f"pose=({own_pose.x:.2f},{own_pose.y:.2f}) "
             f"sc_dist={sc_dist:.2f} sb_dist={sb_dist:.2f} cb_dist={cb_dist:.2f} "
             f"tri_angle={tri_angle:.1f} facing_err={facing_err:.2f} "
-            f"chaser={chaser_id} "
+            f"chaser={chaser_id} {chaser_pose_str}"
             f"target=({target.x:.2f},{target.y:.2f}) "
-            f"ball=({ball.x:.2f},{ball.y:.2f})",
+            f"ball=({ball.x:.2f},{ball.y:.2f})"
+            + (f" dz_role={dz_role}" if dz_role else ""),
             event="supporter_status",
             player_id=player_id,
             mode=mode,
+            pose_x=round(own_pose.x, 2),
+            pose_y=round(own_pose.y, 2),
             sc_dist=round(sc_dist, 2),
             sb_dist=round(sb_dist, 2),
             cb_dist=round(cb_dist, 2),
@@ -340,10 +509,13 @@ class SupporterRole(RoleStrategy):
             facing_error=round(facing_err, 2),
             facing_ball=facing_err < 0.3,
             chaser_id=chaser_id,
+            chaser_pose_x=round(chaser_pose.x, 2) if chaser_pose is not None else None,
+            chaser_pose_y=round(chaser_pose.y, 2) if chaser_pose is not None else None,
             target_x=round(target.x, 2),
             target_y=round(target.y, 2),
             ball_x=round(ball.x, 2),
             ball_y=round(ball.y, 2),
+            danger_zone_role=dz_role,
         )
 
     def wants_to_kick(
