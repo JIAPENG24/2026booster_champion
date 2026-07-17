@@ -98,8 +98,8 @@ def create_team_tree(
             UpdateClock(get_now),
             UpdatePlayContext(context_provider),
             UpdateGameState(),
-            UpdateRecentBall(),
-            UpdateRobotPoses(),
+            UpdateRecentBall(kit),
+            UpdateRobotPoses(kit),
             *[
                 UpdateRobotStatus(kit, player_id)
                 for player_id in kit.config.player_ids

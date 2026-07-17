@@ -205,6 +205,12 @@ class DefaultPlaybook(Playbook):
         targeting = self.kit.targeting
         ball = context.known_ball
 
+        opponent_poses = tuple(
+            opp.pose
+            for opp in context.opponents.values()
+            if opp.pose is not None
+        )
+
         candidates: list[int] = []
         scored: list[tuple[float, int]] = []
         for player_id in config.player_ids:
@@ -215,9 +221,9 @@ class DefaultPlaybook(Playbook):
             robot = context.teammates.get(player_id)
             if robot is None or robot.pose is None:
                 continue
-            scored.append(
-                (targeting.ball_claim_score(slot, robot.pose, ball), player_id)
-            )
+            base_score = targeting.ball_claim_score(slot, robot.pose, ball)
+            penalty = targeting.opponent_approach_penalty(robot.pose, ball, opponent_poses)
+            scored.append((base_score + penalty, player_id))
 
         if not candidates:
             chaser_id = min(config.player_ids)
@@ -257,8 +263,10 @@ class DefaultPlaybook(Playbook):
                 robot = context.teammates.get(self._last_chaser_id)
                 if robot is not None and robot.pose is not None:
                     slot = config.ready_slot_for_player(self._last_chaser_id)
-                    current_score = targeting.ball_claim_score(slot, robot.pose, ball)
-                    if current_score <= best_score + 0.5:
+                    current_base = targeting.ball_claim_score(slot, robot.pose, ball)
+                    current_penalty = targeting.opponent_approach_penalty(robot.pose, ball, opponent_poses)
+                    current_score = current_base + current_penalty
+                    if current_score < best_score + config.strategy.chaser_lock_score_margin_m:
                         chaser_id = self._last_chaser_id
 
         if chaser_id != self._last_chaser_id:
@@ -290,6 +298,7 @@ class DefaultPlaybook(Playbook):
                     ball_x=round(ball.x, 3),
                     ball_y=round(ball.y, 3),
                     candidates=candidate_info,
+                    opponents_tracked=len(opponent_poses),
                 )
 
         return chaser_id

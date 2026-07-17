@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from .behavior_tree import TeamCommandExecutor, TeamStrategyTree, create_team_tree
 from .soccer_framework import (
+    BallLkgBuffer,
     BallState,
     GameControlState,
     GameState,
@@ -32,6 +33,7 @@ from .soccer_framework import (
     MoveIntent,
     NoopIntent,
     Pose2D,
+    PoseLkgBuffer,
     RobotCommand,
     RobotRuntimeStatus,
     RobotState,
@@ -109,6 +111,9 @@ class SoccerKit:
             exit_delay=config.strategy.soccer_kick_exit_delay_sec,
         )
         self.motion = MotionController(config, self.field, self.kicker, self.obstacles)
+        self.ball_lkg = BallLkgBuffer(config)
+        self.pose_lkg_teammates = PoseLkgBuffer(config)
+        self.pose_lkg_opponents = PoseLkgBuffer(config)
         self._robot_services: RobotServices | None = None
 
     # Service binding

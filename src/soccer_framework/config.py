@@ -121,6 +121,31 @@ class SoccerStrategyTuning:
         0.15  #  Tie band for teammate ball-claim distances to prevent oscillating handoff.
     )
 
+    # Chaser opponent interference
+    # Penalize chaser candidates whose approach line to the ball is blocked by
+    # opponents or who are tightly marked (issue 6.1). Penalties are meters-
+    # equivalent and added to the ball_claim_score cost inside select_chaser.
+    # A dedicated lane projection is used instead of reusing lane_clear_score
+    # because the latter's 0.75m pass-lane clearance is too wide for approach paths.
+    chaser_lane_block_radius_m: float = 0.42
+        #  Lateral clearance for lane-block detection on teammate->ball segment (m).
+    chaser_lane_penalty_weight: float = 0.8
+        #  Weight for lane-block penalty: penalty = (1 - lane_score) * weight.
+    chaser_opponent_contest_radius_m: float = 0.75
+        #  Opponent within this distance of ball is contesting possession (m).
+    chaser_contest_weight: float = 0.4
+        #  Linear scale for contest penalty.
+    chaser_marking_radius_m: float = 0.6
+        #  Opponent within this distance of teammate is marking them (m).
+    chaser_marking_weight: float = 0.2
+        #  Linear scale for marking penalty.
+    chaser_max_interference_penalty_m: float = 1.0
+        #  Upper bound on total opponent-interference penalty (m).
+    chaser_lock_score_margin_m: float = 0.3
+        #  Chaser-lock recompute margin: keep old chaser if its score < best + margin.
+        #  Reduced from the prior hardcoded 0.5 so a single penalty swing can break
+        #  the lock when the old chaser becomes blocked.
+
     # Passing
     pass_enabled: bool = True  #  Master pass switch.
     pass_min_score: float = 0.60  #  Minimum pass-candidate score; below this, dribble instead.
@@ -155,6 +180,27 @@ class SoccerStrategyTuning:
     ball_prediction_kd: float = 0.1  #  PID derivative gain for velocity smoothing.
     ball_prediction_friction: float = 0.3  #  Initial friction coefficient for trajectory extrapolation (1/s).
     ball_prediction_max_horizon_sec: float = 2.0  #  Maximum prediction horizon (s).
+
+    # Ball staleness and Last-Known-Good (LKG) buffer
+    # Stage 1: raw ball trusted as-is while last_seen_at is within ball_fresh_sec.
+    # Stage 2: stale ball is kept alive via constant-velocity extrapolation for ball_stale_grace_sec.
+    # Stage 3: ball cleared to None -> SafetyGuards StopAll fires.
+    # Total tolerance = ball_fresh_sec + ball_stale_grace_sec before team-wide stop.
+    # At 30Hz, 0.3s = 9 frames — comfortable margin for ROS callback jitter.
+    # Tunable: increase if simulator exhibits higher sensor latency.
+    ball_fresh_sec: float = 0.3  #  Raw ball trusted if seen within this window (s).
+    ball_stale_grace_sec: float = 0.3  #  LKG extrapolation grace window after raw-trust expiry (s).
+
+    # Robot pose staleness and LKG buffer (mirrors ball with tighter params).
+    # Stage 1: pose trusted while last_seen_at is within robot_pose_fresh_sec.
+    # Stage 2: stale pose kept alive via constant-velocity extrapolation
+    #          (incl. theta) for robot_pose_stale_grace_sec — shorter than ball
+    #          since robot motion under active control is less predictable.
+    # Stage 3: pose cleared to None -> motion controller stops that player.
+    # At 30Hz, 0.2s = 6 frames — absorbs ROS callback jitter while limiting
+    # extrapolation drift; displacement clamp (0.3m) bounds the ghost-pose error.
+    robot_pose_fresh_sec: float = 0.3  #  Raw pose trusted if seen within this window (s).
+    robot_pose_stale_grace_sec: float = 0.2  #  LKG extrapolation grace window after raw-trust expiry (s).
 
     # Goalkeeper state machine
     gk_state_confirm_frames: int = 2  #  Consecutive frames to confirm a state entry transition.

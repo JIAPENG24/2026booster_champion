@@ -22,6 +22,7 @@ __all__ = [
     "ball_beyond_goal_line",
     "ball_beyond_own_goal_line",
     "ball_claim_score",
+    "opponent_approach_penalty",
     "ball_in_own_defensive_area",
     "ball_is_in_midfield_or_own_half",
     "ball_near_sideline",
@@ -112,6 +113,66 @@ def ball_claim_score(
     if slot == ReadySlot.CENTER:
         return distance - 0.20
     return distance - 0.10
+
+
+def opponent_approach_penalty(
+    config: SoccerConfig,
+    teammate_pose: Pose2D,
+    ball: BallState,
+    opponent_poses: tuple[Pose2D, ...],
+) -> float:
+    """Opponent-interference penalty (meters-equivalent) for a chaser candidate.
+
+    Lower = better. Returns 0.0 when no opponents are tracked (degrades to the
+    pre-6.1 behavior where ball_claim_score alone decided the chaser).
+
+    Three components, summed and capped (per Oracle review of issue 6.1):
+    1. Lane block: continuous projection onto teammate->ball segment, radius
+       chaser_lane_block_radius_m. A DEDICATED implementation is used here instead
+       of reusing lane_clear_score, because lane_clear_score applies
+       max(pass_lane_clearance=0.75, radius) which is too wide for approach paths.
+    2. Ball contest: radial distance to ball, radius chaser_opponent_contest_radius_m.
+    3. Marking: radial distance to teammate, radius chaser_marking_radius_m.
+
+    Aggregation uses sum (not max) so that multi-opponent pressure accumulates;
+    the total is capped at chaser_max_interference_penalty_m.
+    """
+    if not opponent_poses:
+        return 0.0
+    penalty = 0.0
+    # 1. Lane block (continuous, segment-clamped, dedicated projection)
+    seg_dx = ball.x - teammate_pose.x
+    seg_dy = ball.y - teammate_pose.y
+    seg_len = math.hypot(seg_dx, seg_dy)
+    if seg_len > 1e-6:
+        dir_x, dir_y = seg_dx / seg_len, seg_dy / seg_len
+        left_x, left_y = -dir_y, dir_x
+        clearance = config.strategy.chaser_lane_block_radius_m
+        lane_score = 1.0  # 1.0 = fully clear, 0.0 = fully blocked
+        for opp in opponent_poses:
+            rel_x = opp.x - teammate_pose.x
+            rel_y = opp.y - teammate_pose.y
+            along = rel_x * dir_x + rel_y * dir_y
+            # Ignore opponents outside the segment (behind teammate or beyond ball)
+            if along <= 0.0 or along >= seg_len:
+                continue
+            lateral = abs(rel_x * left_x + rel_y * left_y)
+            if lateral < clearance:
+                lane_score = min(lane_score, lateral / clearance)
+        penalty += (1.0 - lane_score) * config.strategy.chaser_lane_penalty_weight
+    # 2. Ball contest (opponent near the ball challenges possession)
+    contest_radius = config.strategy.chaser_opponent_contest_radius_m
+    for opp in opponent_poses:
+        d_ball = math.hypot(opp.x - ball.x, opp.y - ball.y)
+        if d_ball < contest_radius:
+            penalty += config.strategy.chaser_contest_weight * (1.0 - d_ball / contest_radius)
+    # 3. Marking (opponent tight on the teammate restricts their approach)
+    marking_radius = config.strategy.chaser_marking_radius_m
+    for opp in opponent_poses:
+        d_tm = math.hypot(opp.x - teammate_pose.x, opp.y - teammate_pose.y)
+        if d_tm < marking_radius:
+            penalty += config.strategy.chaser_marking_weight * (1.0 - d_tm / marking_radius)
+    return min(penalty, config.strategy.chaser_max_interference_penalty_m)
 
 
 def pose_for_slot(

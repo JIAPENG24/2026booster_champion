@@ -101,6 +101,17 @@ class Targeting:
     ) -> float:
         return predicates.ball_claim_score(self.config, slot, pose, ball)
 
+    def opponent_approach_penalty(
+        self,
+        teammate_pose: Pose2D,
+        ball: BallState,
+        opponent_poses: tuple[Pose2D, ...],
+    ) -> float:
+        """Opponent-interference penalty (m) for a chaser candidate (issue 6.1)."""
+        return predicates.opponent_approach_penalty(
+            self.config, teammate_pose, ball, opponent_poses
+        )
+
     def pose_for_slot(
         self,
         context: PlayContext,

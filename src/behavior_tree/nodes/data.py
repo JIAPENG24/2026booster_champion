@@ -30,8 +30,6 @@ if TYPE_CHECKING:
     from ...runtime import SoccerKit
 
 
-_BALL_STALE_SEC = 1.5
-_ROBOT_POSE_STALE_SEC = 2.0
 _GAME_STATE_STALE_SEC = 2.0
 
 
@@ -113,56 +111,58 @@ class UpdateGameState(_DataLeaf):
 
 
 class UpdateRecentBall(_DataLeaf):
-    """Clear a stale ball in place using the data-layer watchdog.
+    """Filter stale ball using the LKG buffer for transparent grace-period extrapolation.
 
-    Like game and robot filtering, this mutates ``context.ball`` directly and does
-    not use a separate blackboard key.
+    Delegates freshness + grace logic to ``kit.ball_lkg``. When the raw ball
+    is stale, the buffer returns a constant-velocity extrapolation during the
+    grace window (confidence=0.5) so SafetyGuards' IsBallKnown check passes
+    and the team keeps playing. After grace expires, the buffer returns None
+    and StopAll fires normally.
+
+    AR-02 compliant: the blackboard (context.ball) remains the sole data source.
+    AR-08 compliant: SafetyGuards is not bypassed — it fires after grace.
     """
 
-    def __init__(self):
+    def __init__(self, kit: "SoccerKit"):
         super().__init__("UpdateRecentBall")
+        self._kit = kit
 
     def update(self) -> py_trees.common.Status:
         context = self.blackboard.read(BlackboardKeys.PLAY_CONTEXT)
         now = self.blackboard.read(BlackboardKeys.NOW)
         if not isinstance(context, PlayContext) or now is None:
             return py_trees.common.Status.SUCCESS
-        if context.ball is not None and not context.ball.is_recent(
-            now, _BALL_STALE_SEC
-        ):
-            context.ball = None
+        context.ball = self._kit.ball_lkg.update(context.ball, now)
         return py_trees.common.Status.SUCCESS
 
 
 class UpdateRobotPoses(_DataLeaf):
-    """Clear stale teammate/opponent poses in place using the data-layer watchdog.
+    """Filter stale teammate/opponent poses via per-team LKG buffers.
 
-    ``context.teammates[i].pose``
-    The snapshot is deep-copied by the provider, so these in-place edits do not
-    pollute provider internals.
+    Delegates freshness + grace logic to ``kit.pose_lkg_teammates`` and
+    ``kit.pose_lkg_opponents``. When a raw pose goes stale, the buffer returns
+    a constant-velocity extrapolation (x, y, and theta) during the grace window
+    so the motion controller and role assignment keep operating for that
+    player instead of emitting a premature ``waiting for pose`` stop. After
+    grace expires, the buffer clears the pose to None and existing
+    ``if robot.pose is None`` checks in strategy and motion code take over.
 
-    Once stale poses become None, existing ``if robot.pose is None`` checks in
-    strategy and motion code work without extra ``last_seen_at`` checks.
+    AR-02 compliant: the blackboard (context.teammates/opponents) remains the
+    sole data source. Grace filtering mutates poses in place on the
+    provider-snapshotted context, so provider internals are not polluted.
     """
 
-    def __init__(self):
+    def __init__(self, kit: "SoccerKit"):
         super().__init__("UpdateRobotPoses")
+        self._kit = kit
 
     def update(self) -> py_trees.common.Status:
         context = self.blackboard.read(BlackboardKeys.PLAY_CONTEXT)
         now = self.blackboard.read(BlackboardKeys.NOW)
         if not isinstance(context, PlayContext) or now is None:
             return py_trees.common.Status.SUCCESS
-        for robot in context.teammates.values():
-            if robot.pose is not None and not robot.is_recent(
-                now, _ROBOT_POSE_STALE_SEC
-            ):
-                robot.pose = None
-        for opponent in context.opponents.values():
-            if opponent.pose is not None and not opponent.is_recent(
-                now, _ROBOT_POSE_STALE_SEC
-            ):
-                opponent.pose = None
+        self._kit.pose_lkg_teammates.update(context.teammates, now)
+        self._kit.pose_lkg_opponents.update(context.opponents, now)
         return py_trees.common.Status.SUCCESS
 
 
