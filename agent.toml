@@ -1,8 +1,8 @@
-id = "com.example.game3v3"
+id = "com.example.lqinternalmatch"
 version = "1.1.0"
-name = { en = "game3V3", zh = "game3V3" }
+name = { en = "lqInternalMatch", zh = "lqInternalMatch" }
 logo = "/res/logo.png"
-description = "Booster Champion 3v3 match agent written in Python"
+description = "3v3 SoccerSim Agent written in Python"
 entry = "src/main.py:SoccerSimAgent"
 debuggable = true
 
