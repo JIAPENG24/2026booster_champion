@@ -268,25 +268,7 @@ class Player:
             self._draw_kick_target(clear_target)
             return kick_dir, KICK_POWER_BACKFIELD
 
-        # 守门员感知:对方守门员偏一侧时射另一侧
-        goalie = self._find_goalie()
-        if goalie is not None:
-            if goalie.y > 0.2:
-                kick_target = (goal_x, -half_goal + 0.2)
-            elif goalie.y < -0.2:
-                kick_target = (goal_x, half_goal - 0.2)
-            else:
-                side = 1.0 if self.id % 2 == 0 else -1.0
-                kick_target = (goal_x, side * half_goal * 0.3)
-        else:
-            # 根据球的位置选择射门目标
-            if ball.y > 0.5:
-                kick_target = (goal_x, -half_goal + 0.2)
-            elif ball.y < -0.5:
-                kick_target = (goal_x, half_goal - 0.2)
-            else:
-                side = 1.0 if self.id % 2 == 0 else -1.0
-                kick_target = (goal_x, side * half_goal * 0.3)
+        kick_target = (goal_x, 0.0)
 
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
         kick_power = KICK_POWER_DEFAULT

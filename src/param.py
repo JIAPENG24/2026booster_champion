@@ -18,9 +18,9 @@ KICK_POWER_MIN = 1.0
 KICK_POWER_MAX = 10.0
 
 # 普通比赛踢球力度。
-KICK_POWER_DEFAULT = 5.0
-KICK_POWER_BACKFIELD = 8.0
-KICK_POWER_OUR_KICKOFF = 5.0
+KICK_POWER_DEFAULT = 3.0
+KICK_POWER_BACKFIELD = 5.0
+KICK_POWER_OUR_KICKOFF = 4.0
 
 
 # ======================================================================
