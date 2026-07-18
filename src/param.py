@@ -19,7 +19,7 @@ KICK_POWER_MAX = 10.0
 
 # 普通比赛踢球力度。
 KICK_POWER_DEFAULT = 5.0
-KICK_POWER_BACKFIELD = 5.0
+KICK_POWER_BACKFIELD = 8.0
 KICK_POWER_OUR_KICKOFF = 5.0
 
 
@@ -40,8 +40,8 @@ ANGULAR_GAIN = 2.0             # 转向 P 增益
 # Player 踢球 / 射门规划
 # ======================================================================
 
-KICK_ENTER_M = 2.0             # 距球小于该值进入踢球状态
-KICK_EXIT_M = 2.5              # 踢球中距球大于该值才退出踢球状态
+KICK_ENTER_M = 1.2             # 距球小于该值进入踢球状态 (原2.0)
+KICK_EXIT_M = 1.5              # 踢球中距球大于该值才退出 (原2.5)
 CHASE_BEHIND_M = 0.35          # 追球时站到球后方的距离
 
 
@@ -53,7 +53,14 @@ GUARD_FACE_BALL = True
 GUARD_THREAT_ENTER_X = -1.0
 GUARD_THREAT_EXIT_X = -0.7
 
+# P2-12: 守门员出击
+GUARD_RUSH_X = -5.0          # 门将出击的球 x 阈值
+GUARD_RUSH_MAX_RATIO = 0.6   # 出击距离占球→门线比例上限
+GUARD_SWEEP_X = -1.0         # 清道夫模式的球 x 阈值
+GUARD_SWEEP_X_POS = -5.0     # 清道夫站位 x
+
 SUPPORT_DIST_M = 3.0
+SUPPORT_STUCK_FRAMES_MAX = 60     # support 卡住帧数上限 (≈2s@30fps)
 
 # ======================================================================
 # Normal 阶段策略
@@ -63,6 +70,14 @@ ATTACKER_KEEP_DIST_MARGIN_M = 0.3  # 防止 Attacker 选择产生震荡
 
 FALLEN_COST = 10.0  # 摔倒球员的距离惩罚值(米)
 
+# P2-13: 动态角色交换
+ATTACKER_STUCK_DIST_DELTA = 0.15   # 单帧最小有效接近距离 (m)
+ATTACKER_STUCK_FRAMES_MAX = 45     # 连续停滞帧数上限 (≈1.5s@30fps)
+
+# 1.1-4: 攻防权重阈值
+DEFEND_BALL_X = -1.0       # 球低于此值 → 防守模式（全员回收）
+ATTACK_BALL_X = 3.0        # 球高于此值 → 进攻模式（双前锋前压）
+
 
 # ======================================================================
 # 开球 / 定位球策略
@@ -70,12 +85,30 @@ FALLEN_COST = 10.0  # 摔倒球员的距离惩罚值(米)
 
 # 开球
 KICKOFF_STAGE_M = 2.0
+
+# 定位球踢球力度
+SET_PLAY_POWER_CORNER = 7.0
+SET_PLAY_POWER_GOAL_KICK = 8.0
+SET_PLAY_POWER_THROW_IN = 4.0
+SET_PLAY_POWER_FREE_KICK = 5.0
+SET_PLAY_POWER_INDIRECT = 2.5
+SET_PLAY_POWER_PENALTY = 8.0
+
+# 对方定位球防守站位
+OPP_SET_PLAY_DEFEND_SPREAD = 0.8
+OPP_SET_PLAY_DEFEND_RATIO_BASE = 0.3
 KICKOFF_FRONT_MARGIN = 0.1
 KICKOFF_LATERAL_TOL = 0.35
 
 CENTER_LEAVE_DIST_M = 0.15 # 球离开中心点多少距离，认为球已经动了
 
 OPP_SET_WALL_DIST_M = 2.0 # 对方开球时，在多少距离之后阻挡
+
+# P2-14: Keep-away 控球拖延
+KEEP_AWAY_GOAL_DIFF = 2         # 最低净胜球
+KEEP_AWAY_TIME = 30.0           # 最后 N 秒启用
+KEEP_AWAY_PRESSURE_DIST = 1.5   # 对手逼抢距离,触发传球
+KEEP_AWAY_CORNER_MARGIN = 1.0   # 角落安全区距边线/底线余量
 
 
 # ======================================================================
@@ -84,6 +117,16 @@ OPP_SET_WALL_DIST_M = 2.0 # 对方开球时，在多少距离之后阻挡
 
 OPPONENT_RESTART_AVOID_M = 1.65
 CIRCLE_MARGIN_M = 0.3
+
+
+# ======================================================================
+# P2-11: 带球变向过人
+# ======================================================================
+
+DRIBBLE_SCAN_RADIUS = 1.5          # 扫描对手距离半径 (m)
+DRIBBLE_SCAN_STEP = math.radians(15)  # 备选方向步进角
+DRIBBLE_POWER = 2.5                # 趟球力度 (低 = 控球变向)
+DRIBBLE_CLEARANCE = 0.4            # 备选方向前方最小净空 (m)
 
 
 # ======================================================================

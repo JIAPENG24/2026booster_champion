@@ -121,6 +121,13 @@ class Player:
         self._support_last_pos: tuple[float, float] | None = None
         self._support_stationary_since: float | None = None
         self._support_last_update_at: float | None = None
+        self._support_stuck_frames: int = 0
+
+        # 2.1-1: 追球拦截用球速追踪
+        self._ball_track_prev: tuple[float, float] | None = None
+        self._ball_track_time: float | None = None
+        self._ball_vx: float = 0.0
+        self._ball_vy: float = 0.0
 
     # ------------------------------------------------------------------
     # 状态读取
@@ -229,24 +236,66 @@ class Player:
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
-    def plan_kick(self) -> tuple[float, float] | None:
-        """计算踢球方向和力度。
+    def _find_goalie(self) -> Pose2D | None:
+        """找到对方守门员位置（距对方球门最近者）。"""
+        ctx = self.context
+        if ctx is None:
+            return None
+        gx, gy = opponent_goal(ctx)
+        best, best_dist = None, math.inf
+        for opp in ctx.opponents.values():
+            if opp.pose is None:
+                continue
+            d = dist(opp.pose.x, opp.pose.y, gx, gy)
+            if d < best_dist:
+                best_dist, best = d, opp.pose
+        return best
 
-        从当前球位踢向对方球门中心,力度 2.0。
-        返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
-        """
+    def plan_kick(self) -> tuple[float, float] | None:
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
             return None
 
-        kick_target = opponent_goal(ctx)
+        half_goal = ctx.field.goal_width / 2.0
+        goal_x = ctx.field.length / 2.0
+
+        # 远距离解围:球在我方半场时大脚向中场边路
+        if self._in_backfield():
+            side = 1.0 if self.id % 2 == 0 else -1.0
+            clear_target = (0.0, side * ctx.field.width * 0.3)
+            kick_dir = angle_to(ball.x, ball.y, *clear_target)
+            self._draw_kick_target(clear_target)
+            return kick_dir, KICK_POWER_BACKFIELD
+
+        # 守门员感知:对方守门员偏一侧时射另一侧
+        goalie = self._find_goalie()
+        if goalie is not None:
+            if goalie.y > 0.2:
+                kick_target = (goal_x, -half_goal + 0.2)
+            elif goalie.y < -0.2:
+                kick_target = (goal_x, half_goal - 0.2)
+            else:
+                side = 1.0 if self.id % 2 == 0 else -1.0
+                kick_target = (goal_x, side * half_goal * 0.3)
+        else:
+            # 根据球的位置选择射门目标
+            if ball.y > 0.5:
+                kick_target = (goal_x, -half_goal + 0.2)
+            elif ball.y < -0.5:
+                kick_target = (goal_x, half_goal - 0.2)
+            else:
+                side = 1.0 if self.id % 2 == 0 else -1.0
+                kick_target = (goal_x, side * half_goal * 0.3)
+
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_target = self._goal_target_for_direction(kick_direction)
-        kick_power = (
-            KICK_POWER_BACKFIELD if self._in_backfield()
-            else KICK_POWER_DEFAULT
-        )
+        kick_power = KICK_POWER_DEFAULT
+
+        # 角度偏差检查:与球门中心方向偏离 > 60° 时放弃射门
+        goal_center_dir = angle_to(ball.x, ball.y, goal_x, 0.0)
+        angle_deviation = abs(normalize_angle(kick_direction - goal_center_dir))
+        if angle_deviation > math.radians(60):
+            return None
 
         self._draw_kick_target(kick_target)
         return kick_direction, kick_power
@@ -563,13 +612,80 @@ class Player:
         ty = ay + vy * t
         return tx, ty, dist(pose.x, pose.y, tx, ty), raw_t
 
-    def attack(self, kick_target: tuple[float, float] | None = None) -> None:
-        """追球射门。踢向 ``kick_target``(默认对方球门中心)。
+    def pass_to(self, teammate_id: int) -> bool:
+        """传球给指定队友。返回是否成功发出。"""
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        mate = ctx.teammates.get(teammate_id) if ctx is not None else None
+        if ball is None or mate is None or mate.pose is None or self.pose is None:
+            return False
+        kick_dir = angle_to(ball.x, ball.y, mate.pose.x, mate.pose.y)
+        dist_to_mate = dist(ball.x, ball.y, mate.pose.x, mate.pose.y)
+        power = clamp(dist_to_mate * 1.5, 2.0, 6.0)
+        self.kick(kick_dir, power)
+        self.action = f"pass_to_{teammate_id}"
+        return True
 
-        踢球迟滞:距球 ≤ ENTER 进入踢球;进入后距球 > EXIT 才退出(EXIT > ENTER),
-        防边界抖动。不避障——正常拼抢要直取球。追球目标设在【球后方】(球→球门连线
-        上、背离球门退 ``CHASE_BEHIND_M``),到位时天然对准射门方向。
-        """
+    def _pick_dribble_direction(self, direct_dir: float) -> float | None:
+        """检查直接射门方向是否有对手挡路,有则选变向方向,无则返回 None。"""
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return None
+        pose = self.pose
+        if pose is None:
+            return None
+
+        # 收集 DRIBBLE_SCAN_RADIUS 内的对手
+        threats = []
+        for oid, opp in ctx.opponents.items():
+            if opp.pose is None:
+                continue
+            od = dist(pose.x, pose.y, opp.pose.x, opp.pose.y)
+            if od < DRIBBLE_SCAN_RADIUS:
+                threats.append(opp.pose)
+
+        if not threats:
+            return None
+
+        # 对手在直接方向的正前方投影(沿 direct_dir 方向)
+        dx = math.cos(direct_dir)
+        dy = math.sin(direct_dir)
+        blocked = False
+        for t in threats:
+            tx, ty = t.x - pose.x, t.y - pose.y
+            proj = tx * dx + ty * dy
+            lateral = abs(-tx * dy + ty * dx)
+            if proj > 0.0 and lateral < 0.5:
+                blocked = True
+                break
+
+        if not blocked:
+            return None
+
+        # 被堵:扫描备选方向,选最朝 goal + 净空足够的
+        best_h = direct_dir
+        best_clear = -math.inf
+        for offset in range(1, 8):
+            for sign in (1.0, -1.0):
+                h = direct_dir + sign * offset * DRIBBLE_SCAN_STEP
+                h = normalize_angle(h)
+                min_clear = math.inf
+                for t in threats:
+                    tx, ty = t.x - pose.x, t.y - pose.y
+                    proj = math.cos(h) * tx + math.sin(h) * ty
+                    lat = abs(-math.sin(h) * tx + math.cos(h) * ty)
+                    if proj > 0.0 and lat < min_clear:
+                        min_clear = lat
+                if min_clear >= DRIBBLE_CLEARANCE:
+                    return h
+                if min_clear > best_clear:
+                    best_clear = min_clear
+                    best_h = h
+        return best_h if best_h != direct_dir else None
+
+    def attack(self, kick_target: tuple[float, float] | None = None) -> None:
+        """追球射门。角度太差时会尝试传球,禁区内轻推。"""
         ball = self.context.ball if self.context is not None else None
         if ball is None or self.pose is None:
             self.stop()
@@ -577,76 +693,213 @@ class Player:
         if kick_target is None:
             kick_target = opponent_goal(self.context)
 
+        # 更新球速追踪(用于拦截预测)
+        if self._ball_track_prev is not None and self._ball_track_time is not None:
+            dt = ball.last_seen_at - self._ball_track_time
+            if 0.001 < dt < 1.0:
+                self._ball_vx = (ball.x - self._ball_track_prev[0]) / dt
+                self._ball_vy = (ball.y - self._ball_track_prev[1]) / dt
+        self._ball_track_prev = (ball.x, ball.y)
+        self._ball_track_time = ball.last_seen_at
+
         d = dist(self.pose.x, self.pose.y, ball.x, ball.y)
         self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
         if self._kicking:
             kick_plan = self.plan_kick()
             if kick_plan is None:
+                ctx = self.context
+                if ctx is not None:
+                    best_mate = None
+                    best_score = -999
+                    for pid, mate in ctx.teammates.items():
+                        if pid == self.id or mate.pose is None:
+                            continue
+                        if mate.pose.x > best_score:
+                            best_score = mate.pose.x
+                            best_mate = pid
+                    if best_mate is not None and self.pass_to(best_mate):
+                        return
                 self.stop()
                 return
             kick_direction, kick_power = kick_plan
+            # 禁区内轻推
+            if ball.x > 4.0:
+                kick_power = clamp(kick_power * 0.5, 2.0, 3.5)
+            # P2-11: 带球变向 - 检查前方是否有对手挡路
+            dribble_dir = self._pick_dribble_direction(kick_direction)
+            if dribble_dir is not None:
+                kick_direction = dribble_dir
+                kick_power = DRIBBLE_POWER
+                self.action = "dribble"
+            # 角度太差且有人可传时传球
+            if dribble_dir is None and not self.kick_can_score(kick_direction):
+                ctx = self.context
+                if ctx is not None:
+                    best_mate = None
+                    best_score = -999
+                    for pid, mate in ctx.teammates.items():
+                        if pid == self.id or mate.pose is None:
+                            continue
+                        if mate.pose.x > best_score:
+                            best_score = mate.pose.x
+                            best_mate = pid
+                    if best_mate is not None and self.pass_to(best_mate):
+                        return
             self.kick(kick_direction, kick_power)
         else:
             self.release_kick()
-            self.walk_to(
-                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
-            )
+            # 远距离时走向预测位拦截
+            if d > KICK_ENTER_M * 2.0:
+                pred_x = ball.x + self._ball_vx * 0.5
+                pred_y = ball.y + self._ball_vy * 0.5
+                walk_target = _behind_ball(pred_x, pred_y, kick_target, CHASE_BEHIND_M)
+            else:
+                walk_target = _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
+            self.walk_to(walk_target)
 
     def guard(self) -> None:
-        """守门:站小禁区中央待命
-
-        无 pose(未就位)时退回站小禁区中央。
-        """
-        home = own_goal_area_center(self.context) if self.context is not None else None
-        if home is None or self.pose is None:
+        """守门:三模式——HOME(门线跟球)、RUSH(前冲封堵)、SWEEP(前提清道夫)。"""
+        ctx = self.context
+        if ctx is None or self.pose is None:
             self.action = "guard:stop"
             self.stop()
             return
 
-        ball = self.context.ball if self.context is not None else None
+        ball = ctx.ball
+        gx, gy = own_goal(ctx)
+        home_x = own_goal_area_center(ctx)[0]
 
-        # 待命朝向:朝球(便于快速反应);球不可见则朝对方门方向(默认 0)。
+        # 球不可见时回 HOME
+        if ball is None:
+            target = (home_x, 0.0)
+            mode = "home"
+        elif ball.x > GUARD_RUSH_X:
+            # RUSH: 球逼近禁区,前冲封射门角度
+            ratio = min(
+                (ball.x - GUARD_RUSH_X) / (ctx.field.length / 2.0 - GUARD_RUSH_X),
+                GUARD_RUSH_MAX_RATIO,
+            )
+            tx = gx + ratio * (ball.x - gx) * 0.5
+            max_y = ctx.field.goal_width / 2.0 - 0.3
+            ty = clamp(ball.y * 0.6, -max_y, max_y)
+            target = (tx, ty)
+            mode = "rush"
+        elif ball.x < GUARD_SWEEP_X:
+            # SWEEP: 球在对方半场,前提清道夫
+            tx = GUARD_SWEEP_X_POS
+            max_y = ctx.field.goal_width / 2.0 - 0.3
+            ty = clamp(ball.y * 0.4, -max_y, max_y)
+            target = (tx, ty)
+            mode = "sweep"
+        else:
+            # HOME: 门线横向跟球
+            max_y = ctx.field.goal_width / 2.0 - 0.3
+            target_y = clamp(ball.y * 0.5, -max_y, max_y)
+            if ball.x > 0:
+                target_y *= 0.6
+            target = (home_x, target_y)
+            mode = "home"
+
         face = 0.0
         if GUARD_FACE_BALL and ball is not None:
-            face = angle_to(
-                self.pose.x, self.pose.y, ball.x, ball.y,
-            )
+            face = angle_to(self.pose.x, self.pose.y, ball.x, ball.y)
 
-        self.action = "guard:home"
+        self.action = f"guard:{mode}"
         debugdraw.point(
-            home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
+            target[0], target[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        self.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
 
-    def support(self) -> None:
-        """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。
-
-        站位点在球与己方门之间的封堵线上。
-        """
+    def support(self, mark_opponent_id: int | None = None) -> None:
+        """支援:可指定盯防对手,否则根据球位置动态站位。"""
         ctx = self.context
         if ctx is None:
             self.stop()
             return
 
-        ball = self.context.ball
+        ball = ctx.ball
+
+        # 盯人模式:站在最危险对手和我方球门之间
+        if mark_opponent_id is not None:
+            opp = ctx.opponents.get(mark_opponent_id)
+            if opp is not None and opp.pose is not None and ball is not None:
+                gx, gy = own_goal(ctx)
+                ox, oy = opp.pose.x, opp.pose.y
+                # 对手→球门连线中点偏球门侧 (70% toward goal)
+                tx = (ox + gx) / 2.0 * 0.7 + gx * 0.3
+                ty = (oy + gy) / 2.0
+                half_l = ctx.field.length / 2.0
+                half_w = ctx.field.width / 2.0 - 0.3
+                tx = clamp(tx, -half_l + 0.3, half_l)
+                ty = clamp(ty, -half_w, half_w)
+                self.move_to_position((tx, ty))
+                self.action = "mark"
+                # 盯人模式下也做卡住检测
+                if self.pose is not None:
+                    if self._support_last_pos is not None:
+                        moved = dist(
+                            self.pose.x, self.pose.y,
+                            self._support_last_pos[0], self._support_last_pos[1],
+                        )
+                        if moved < 0.05:
+                            self._support_stuck_frames += 1
+                        else:
+                            self._support_stuck_frames = 0
+                    self._support_last_pos = (self.pose.x, self.pose.y)
+                    if self._support_stuck_frames > SUPPORT_STUCK_FRAMES_MAX:
+                        self._support_stuck_frames = 0
+                        self.action = "support_stuck_attack"
+                        self.attack()
+                return
+
+        # 备用:原逻辑
+        if ball is None:
+            self.move_to_position(own_goal_area_center(ctx))
+            return
+
+        if ball.x < -3.0:
+            dist_factor = 1.5
+        elif ball.x < 0:
+            dist_factor = 2.5
+        elif ball.x < 3.0:
+            dist_factor = 3.5
+        else:
+            dist_factor = 4.0
+
         gx, gy = own_goal(ctx)
-        bx, by = (ball.x, ball.y)
+        bx, by = ball.x, ball.y
         dx, dy = gx - bx, gy - by
         d = math.hypot(dx, dy)
         if d < 1e-6:
             ux, uy = -1.0, 0.0
         else:
             ux, uy = dx / d, dy / d
-        along = min(SUPPORT_DIST_M, d)
+        along = min(dist_factor, d)
         tx = bx + ux * along
         ty = by + uy * along
 
-        # 不越过己方底线(x >= 门线 + 0.3),横向夹进场内
         half_l = ctx.field.length / 2.0
         half_w = ctx.field.width / 2.0 - 0.3
         tx = clamp(tx, -half_l + 0.3, half_l)
         ty = clamp(ty, -half_w, half_w)
         self.move_to_position((tx, ty))
+
+        # 卡住检测: 长时间不动则临时 attack
+        if self.pose is not None:
+            if self._support_last_pos is not None:
+                moved = dist(
+                    self.pose.x, self.pose.y,
+                    self._support_last_pos[0], self._support_last_pos[1],
+                )
+                if moved < 0.05:
+                    self._support_stuck_frames += 1
+                else:
+                    self._support_stuck_frames = 0
+            self._support_last_pos = (self.pose.x, self.pose.y)
+            if self._support_stuck_frames > SUPPORT_STUCK_FRAMES_MAX:
+                self._support_stuck_frames = 0
+                self.action = "support_stuck_attack"
+                self.attack()
 
     def take_kickoff(self, kick_target: tuple[float, float] | None = None) -> None:
         """我方开球/重开:未就位则绕到球后待命(避球不碰),就位后接近并踢。"""
@@ -670,6 +923,65 @@ class Player:
             self.walk_to(stage, face=kick_dir, avoid_ball=True)
         else:
             self.attack(kick_target)
+
+    def keep_away(self) -> None:
+        """控球拖延:走向己方角落安全区,被逼抢则传最远的队友。"""
+        ctx = self.context
+        pose = self.pose
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or pose is None or ball is None:
+            self.stop()
+            return
+
+        d = dist(pose.x, pose.y, ball.x, ball.y)
+
+        # 有球权:带向己方角落或传球
+        if d < KICK_ENTER_M * 1.5:
+            # 最近对手距离
+            min_opp_dist = math.inf
+            for opp in ctx.opponents.values():
+                if opp.pose is None:
+                    continue
+                od = dist(pose.x, pose.y, opp.pose.x, opp.pose.y)
+                if od < min_opp_dist:
+                    min_opp_dist = od
+
+            if min_opp_dist < KEEP_AWAY_PRESSURE_DIST:
+                # 被逼抢:传最远的队友
+                best_mate = None
+                best_dist = -1.0
+                for pid, mate in ctx.teammates.items():
+                    if pid == self.id or mate.pose is None:
+                        continue
+                    md = dist(pose.x, pose.y, mate.pose.x, mate.pose.y)
+                    if md > best_dist:
+                        best_dist = md
+                        best_mate = pid
+                if best_mate is not None and self.pass_to(best_mate):
+                    return
+
+            # 带向己方角落
+            half_l = ctx.field.length / 2.0
+            half_w = ctx.field.width / 2.0
+            corner_x = -half_l + KEEP_AWAY_CORNER_MARGIN
+            corner_y = half_w - KEEP_AWAY_CORNER_MARGIN if self.id % 2 == 0 else -half_w + KEEP_AWAY_CORNER_MARGIN
+            face = angle_to(pose.x, pose.y, corner_x, corner_y)
+            self.release_kick()
+            self.walk_to(
+                (corner_x, corner_y), face=face,
+                avoid_ball=True, avoid_robots=True,
+            )
+            return
+
+        # 无球:走向球侧方接应
+        side = 1.0 if self.id % 2 == 0 else -1.0
+        support_x = clamp(ball.x - 1.5, -ctx.field.length / 2.0 + 0.3, ctx.field.length / 2.0)
+        support_y = clamp(ball.y + side * 2.0, -ctx.field.width / 2.0 + 0.3, ctx.field.width / 2.0 - 0.3)
+        self.release_kick()
+        self.walk_to(
+            (support_x, support_y),
+            avoid_ball=True, avoid_robots=True,
+        )
 
     def move_to_position(self, target: tuple[float, float] | None) -> None:
         """走到站位点(支援/防守/避让),面向球,避球+避机器人。"""
