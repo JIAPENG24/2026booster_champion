@@ -528,6 +528,20 @@ class GoalkeeperRole(RoleStrategy):
             rush_margin = strat.gk_rush_out_margin_m
         rush_cond = rest_x < area_x - rush_margin and abs(rest_y) <= area_y
 
+        # Max-distance filter: prevent GK chasing balls too far from current
+        # position (issue 9.2c). Only check when NOT already in RUSH_OUT so
+        # an in-progress rush-out is not interrupted mid-approach.
+        if rush_cond and self._gk_state != self._RUSH_OUT:
+            gk_id = kit.config.goalkeeper_player_id()
+            gk_robot = context.teammates.get(gk_id)
+            if gk_robot is not None and gk_robot.pose is not None:
+                dist = math.hypot(
+                    rest_x - gk_robot.pose.x,
+                    rest_y - gk_robot.pose.y,
+                )
+                if dist > strat.gk_rush_out_max_dist_m:
+                    rush_cond = False
+
         # LATERAL: ball predicted to cross goal line within posts
         goal_x = kit.field.own_goal_x()
         goal_hw = kit.config.goal_width / 2.0

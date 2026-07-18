@@ -138,7 +138,7 @@ class SoccerStrategyTuning:
 
     # Goalkeeping and challenges
     goalkeeper_challenge_area_x_ratio: float = 0.20  #  X-axis ratio for defensive challenge area (field_length * ratio = area boundary).
-    goalkeeper_challenge_area_y: float = 2.2  #  Y-axis half-width for defensive challenge area (m).
+    goalkeeper_challenge_area_y: float = 1.5  #  Y-axis half-width for defensive challenge area (m). Tightened from 2.2 (wider than goal_half=1.3) so GK only rushes for balls near the goal mouth (issue 9.2a).
     goalkeeper_challenge_hysteresis_m: float = 0.30  #  Hysteresis band to prevent guard↔clear oscillation at boundary.
     goalkeeper_clear_hold_sec: float = 1.5  #  Minimum time the goalkeeper stays in clear state after entering it (s).
     goalkeeper_rush_speed_multiplier: float = 2.2  #  Rush-out/retreat speed multiplier for goalkeeper.
@@ -160,8 +160,9 @@ class SoccerStrategyTuning:
     gk_state_confirm_frames: int = 2  #  Consecutive frames to confirm a state entry transition.
     gk_state_release_frames: int = 4  #  Consecutive frames to confirm a state exit transition.
     gk_target_smooth_speed: float = 2.0  #  Max target position change rate for trajectory smoothing (m/s).
-    gk_rush_out_margin_m: float = 0.8  #  Entry margin for RUSH_OUT: predicted rest_x must be this deep inside area (m).
-    gk_rush_out_exit_margin_m: float = 0.3  #  Exit margin for RUSH_OUT: rest_x must be this close to area boundary to exit (m).
+    gk_rush_out_margin_m: float = 0.5  #  Entry margin for RUSH_OUT: predicted rest_x must be this deep inside area (m). Reduced from 0.8 for faster response (issue 9.2b).
+    gk_rush_out_exit_margin_m: float = 0.2  #  Exit margin for RUSH_OUT: rest_x must be this close to area boundary to exit (m). Reduced from 0.3 (issue 9.2b).
+    gk_rush_out_max_dist_m: float = 2.5  #  Max distance (m) from current GK pose to predicted rest point for RUSH_OUT entry. Prevents GK from chasing balls too far from goal (issue 9.2c).
     gk_lateral_hold_min_sec: float = 0.8  #  Minimum time in LATERAL state before allowing transition away (s).
     gk_desperation_clear_margin_m: float = 1.5  #  Ball-to-goal-line distance below which GK uses desperation clear (m).
 
